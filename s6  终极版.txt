@@ -1,0 +1,415 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <U8g2_for_Adafruit_GFX.h> 
+#include <FluxGarage_RoboEyes.h>
+#include <OneButton.h>
+#include <Preferences.h> 
+
+/* ================= OLED & 引脚配置 ================= */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_SDA 21  
+#define OLED_SCL 20  
+
+#define LF   0
+#define LB   1
+#define RF   2
+#define RB   3
+#define STBY 5
+#define TOUCH_PIN 4 
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+U8G2_FOR_ADAFRUIT_GFX u8g2Fonts; 
+
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+Preferences preferences;
+
+/* ================= 状态变量 ================= */
+int moods[] = { DEFAULT, HAPPY, ANGRY, TIRED };
+int currentMoodIdx = 0;
+unsigned long lastMoodTime = 0;
+const unsigned long moodInterval = 5000; 
+bool isEyeLocked = false;
+
+bool displayFeedbackActive = false;
+unsigned long feedbackStartTime = 0;
+const unsigned long feedbackDuration = 700;
+String feedbackText = "";
+
+enum RandomMode { RANDOM_OFF, RANDOM_SOFT, RANDOM_NORMAL };
+volatile RandomMode randomMode = RANDOM_NORMAL;
+RandomMode backupMode = RANDOM_NORMAL; 
+
+unsigned long lastWebControlTime = 0;
+unsigned long motorStopTimer = 0;      
+unsigned long modeRestoreTimer = 0;    
+bool isAutoSleeping = false;           
+
+/* ================= WiFi 配置变量 ================= */
+String sta_ssid = "";
+String sta_password = "";
+bool isAPMode = false;
+
+/* ================= 辅助工具函数 ================= */
+
+// 信号强度转换：将 -100~0 映射为 0~100 (数值越大信号越好)
+int getSignalScore(int rssi) {
+  if (rssi == 0) return 0;
+  return constrain(rssi + 100, 0, 100); 
+}
+
+/* ================= 触摸检测 ================= */
+bool isTouching() {
+  pinMode(TOUCH_PIN, OUTPUT);       
+  digitalWrite(TOUCH_PIN, LOW);    
+  delayMicroseconds(1000);         
+  pinMode(TOUCH_PIN, INPUT_PULLUP); 
+  uint32_t count = 0;              
+  while (digitalRead(TOUCH_PIN) == LOW && count < 2000) { 
+    count++;                       
+    asm volatile ("nop");          
+  }
+  return (count > 2);
+}
+
+OneButton button;
+
+String getStatusJSON() {
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  bool default_ap = preferences.getBool("default_ap", false);
+  return "{\"mode\":" + String((int)randomMode) + 
+         ",\"lock\":" + String(isEyeLocked ? 1 : 0) + 
+         ",\"saved_ssid\":\"" + sta_ssid + "\"" +
+         ",\"ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"" +
+         ",\"rssi\":" + String(getSignalScore(rssi)) + 
+         ",\"default_ap\":" + String(default_ap ? "true" : "false") + "}";
+}
+
+/* ================= 屏幕显示控制 ================= */
+
+// 开启 AP 热点模式
+void startAP() {
+  isAPMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("桌面机器人");
+  
+  // 4秒倒计时界面
+  for (int i = 4; i > 0; i--) {
+    display.clearDisplay();
+    u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("热点模式");
+    u8g2Fonts.setCursor(0, 31); u8g2Fonts.print("请连接WiFi：桌面机器人");
+    u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：192.168.4.1");
+    u8g2Fonts.setCursor(0, 62); u8g2Fonts.print(String(i) + "秒后关闭该界面");
+    display.display();
+    delay(1000);
+  }
+}
+
+// 初始化 WiFi (STA 或 AP)
+void initWiFi() {
+  preferences.begin("wifi-cfg", false);
+  sta_ssid = preferences.getString("ssid", "");
+  sta_password = preferences.getString("password", "");
+  bool default_ap = preferences.getBool("default_ap", false);
+
+  if (default_ap || sta_ssid == "") {
+    startAP();
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    
+    unsigned long startTime = millis();
+    bool connected = false;
+    
+    // 5秒内尝试连接并实时更新屏幕状态
+    while (millis() - startTime < 5000) {
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        break;
+      }
+      
+      display.clearDisplay();
+      u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+      u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：正在连接");
+      u8g2Fonts.setCursor(0, 31); u8g2Fonts.print(sta_ssid);
+      u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：" + WiFi.localIP().toString());
+      u8g2Fonts.setCursor(0, 62); u8g2Fonts.print("信号强度" + String(getSignalScore(WiFi.RSSI())) + "dBm");
+      display.display();
+      delay(200); 
+    }
+    
+    if (connected) {
+      isAPMode = false;
+      // --- 成功连接后的 4 秒倒计时界面 (按照最新要求修改) ---
+      for (int i = 4; i > 0; i--) {
+        display.clearDisplay();
+        u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+        u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：已连接");
+        u8g2Fonts.setCursor(0, 31); u8g2Fonts.print(sta_ssid);
+        u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：" + WiFi.localIP().toString());
+        u8g2Fonts.setCursor(0, 62); 
+        // 将信号强度和倒计时显示在最后一行
+        u8g2Fonts.print("信号强度" + String(getSignalScore(WiFi.RSSI())) + "dBm;  " + String(i) + "s");
+        display.display();
+        delay(1000);
+      }
+    } else {
+      // 5秒内未连上，倒计时后切回热点
+      preferences.putBool("default_ap", true); 
+      for (int i = 4; i > 0; i--) {
+        display.clearDisplay();
+        u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+        u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：连接失败");
+        u8g2Fonts.setCursor(0, 31); u8g2Fonts.print("请重新配置WiFi...");
+        u8g2Fonts.setCursor(0, 55); u8g2Fonts.print(String(i) + "秒后进入热点模式");
+        display.display();
+        delay(1000);
+      }
+      startAP();
+    }
+  }
+  display.clearDisplay();
+  display.display();
+}
+
+/* ================= 电机控制 ================= */
+void motorWifi(byte c) {
+  digitalWrite(STBY, HIGH);
+  switch (c) {
+    case 0: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+    case 1: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+    case 2: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+    case 3: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+    case 4: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+  }
+}
+
+void handleMovement(byte dir) {
+  motorWifi(dir);
+  lastWebControlTime = millis();
+  motorStopTimer = millis() + 10000;
+  if (!isAutoSleeping) {
+    backupMode = randomMode;
+    randomMode = RANDOM_OFF;
+    isAutoSleeping = true;
+  }
+  modeRestoreTimer = millis() + 15000;
+}
+
+void MOTOR(byte c, int t1, int t2, int Time) {
+  for (int i = 0; i < Time; i++) {
+    switch (c) {
+      case 0: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+      case 1: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+      case 2: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+      case 3: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+      case 4: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+      case 5: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+      case 6: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+      case 7: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+      case 8: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+    }
+    delay(t1);
+    digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW);
+    delay(t2);
+  }
+}
+
+/* ================= 核心交互逻辑 ================= */
+void triggerModeSwitch() {
+  if (randomMode == RANDOM_OFF) randomMode = RANDOM_SOFT;
+  else if (randomMode == RANDOM_SOFT) randomMode = RANDOM_NORMAL;
+  else randomMode = RANDOM_OFF;
+  
+  feedbackText = (randomMode == RANDOM_OFF) ? "睡眠模式" : (randomMode == RANDOM_SOFT ? "摆动模式" : "好奇模式");
+  displayFeedbackActive = true;
+  feedbackStartTime = millis();
+}
+
+void triggerLockExpression() {
+  isEyeLocked = !isEyeLocked;
+  feedbackText = isEyeLocked ? "表情已锁定" : "表情已解锁";
+  displayFeedbackActive = true;
+  feedbackStartTime = millis();
+}
+
+/* ================= Web 服务器 ================= */
+WebServer server(80);
+DNSServer dnsServer;
+
+void handleRoot() {
+  // 此处保持你原有的 HTML 控制面板代码，省略展示以节省篇幅
+  String page = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Control</title><style>
+body{margin:0;background:#000;color:#00ffe1;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;padding:10px;}
+.panel{width:90%;max-width:300px;padding:15px;border-radius:18px;background:rgba(0,255,225,0.05);border:1px solid rgba(0,255,225,0.4);margin-bottom:15px;}
+h2,h3{text-align:center;margin:5px;}
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;}
+button{border:none;border-radius:10px;font-size:16px;background:linear-gradient(145deg,#0ff,#00b3a4);padding:12px 0;cursor:pointer;font-weight:bold;}
+button:active{opacity:0.6;transform:scale(0.95);}
+.mode, .expr{display:flex;gap:5px;margin-top:10px;}
+.mode button, .expr button{flex:1;font-size:12px;opacity:0.4;background:#444;color:#fff;}
+.active{opacity:1 !important;background:linear-gradient(145deg,#00ff9c,#00c46a) !important;}
+.wifi-box{display:flex;flex-direction:column;gap:8px;}
+input{background:#111;border:1px solid #0ff;color:#fff;padding:10px;border-radius:5px;}
+.info{font-size:11px;color:#888;margin-top:5px;text-align:center;}
+.danger{background:linear-gradient(145deg,#ff5555,#aa0000) !important; color:white !important; opacity:1 !important;}
+</style></head><body>
+<div class="panel"><h2>控制中心</h2><div class="grid">
+    <div></div><button onclick="send('/f')">前进</button><div></div>
+    <button onclick="send('/l')">左转</button><button style="background:#f55;color:#fff;" onclick="send('/s')">停止</button><button onclick="send('/r')">右转</button>
+    <div></div><button onclick="send('/b')">后退</button><div></div>
+</div></div>
+<div class="panel"><h3>模式与表情</h3><div class="mode">
+    <button id="m_0" onclick="send('/mode_off')">睡眠</button>
+    <button id="m_1" onclick="send('/mode_soft')">摆动</button>
+    <button id="m_2" onclick="send('/mode_normal')">好奇</button>
+</div><div class="expr">
+    <button onclick="send('/expr_next')">切换表情</button>
+    <button id="btn_lock_expr" onclick="send('/expr_lock')">锁定表情</button>
+</div></div>
+<div class="panel"><h3>WiFi 配置</h3><div class="wifi-box">
+    <input type="text" id="ssid" placeholder="WiFi名称(SSID)">
+    <input type="password" id="pass" placeholder="WiFi密码">
+    <button style="background:#00ff9c" onclick="saveWiFi()">保存配置</button>
+    <button id="btn_toggle_mode" class="danger" onclick="toggleMode()">切换模式</button>
+    <div id="status" class="info">状态获取中...</div>
+</div></div>
+<script>
+function render(d){
+  document.querySelectorAll('.mode button').forEach((b,i)=>b.classList.toggle('active',i==d.mode));
+  document.getElementById('btn_lock_expr').classList.toggle('active', d.lock==1);
+  document.getElementById('status').innerHTML = `配置WiFi:${d.saved_ssid}<br>IP地址: ${d.ip} | 信号强度: ${d.rssi}`;
+  document.getElementById('btn_toggle_mode').innerText = d.default_ap ? '切换为WiFi模式' : '切换为热点模式';
+}
+function send(u){fetch(u).then(r=>r.json()).then(d=>render(d));}
+function saveWiFi(){
+  let s = document.getElementById('ssid').value; let p = document.getElementById('pass').value;
+  if(!s) return; 
+  fetch(`/set_wifi?s=${encodeURIComponent(s)}&p=${encodeURIComponent(p)}`)
+    .then(r=>r.text()).then(t=>{
+      alert(t);
+      document.getElementById('ssid').value = '';
+      document.getElementById('pass').value = '';
+      fetch('/status').then(r=>r.json()).then(d=>render(d)); 
+    });
+}
+function toggleMode(){ 
+  if(confirm("确定要切换开机默认连接模式并重启吗？")){ 
+    fetch('/toggle_mode').then(r=>r.text()).then(t=>{alert(t);location.reload();}); 
+  } 
+}
+setInterval(()=>{ fetch('/status').then(r=>r.json()).then(d=>render(d)); }, 3000);
+fetch('/status').then(r=>r.json()).then(d=>render(d));
+</script></body></html>
+)rawliteral";
+  server.send(200, "text/html", page);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
+  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT); pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  
+  u8g2Fonts.begin(display);
+  u8g2Fonts.setFontMode(1);                 
+  u8g2Fonts.setFontDirection(0);            
+  u8g2Fonts.setForegroundColor(SSD1306_WHITE); 
+  
+  initWiFi(); 
+
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
+  roboEyes.setAutoblinker(ON, 3, 2);
+  roboEyes.setIdleMode(ON, 2, 2);
+  roboEyes.setMood(moods[currentMoodIdx]);
+
+  button.attachClick([](){ isEyeLocked=false; currentMoodIdx=(currentMoodIdx+1)%4; roboEyes.setMood(moods[currentMoodIdx]); lastMoodTime=millis(); });
+  button.attachDoubleClick(triggerModeSwitch);
+  button.attachLongPressStart(triggerLockExpression);
+
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  
+  server.on("/", handleRoot);
+  server.on("/status", [](){ server.send(200, "application/json", getStatusJSON()); });
+  server.on("/f", [](){ handleMovement(1); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/b", [](){ handleMovement(2); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/l", [](){ handleMovement(3); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/r", [](){ handleMovement(4); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/s", [](){ motorWifi(0); motorStopTimer=0; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_off", [](){ randomMode=RANDOM_OFF; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_soft", [](){ randomMode=RANDOM_SOFT; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_normal", [](){ randomMode=RANDOM_NORMAL; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/expr_next", [](){ isEyeLocked=false; currentMoodIdx=(currentMoodIdx+1)%4; roboEyes.setMood(moods[currentMoodIdx]); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/expr_lock", [](){ triggerLockExpression(); server.send(200, "application/json", getStatusJSON()); });
+
+  server.on("/toggle_mode", [](){
+    bool current_ap = preferences.getBool("default_ap", false);
+    preferences.putBool("default_ap", !current_ap);
+    server.send(200, "text/plain", "已切换模式，正在重启");
+    delay(1000); ESP.restart();
+  });
+
+  server.on("/set_wifi", [](){
+    sta_ssid = server.arg("s");
+    sta_password = server.arg("p");
+    preferences.putString("ssid", sta_ssid);
+    preferences.putString("password", sta_password);
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.onNotFound([]() {
+    if (isAPMode) {
+      server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+      server.send(302, "text/plain", "");
+    } else {
+      server.send(404, "text/plain", "Not Found");
+    }
+  });
+
+  server.begin();
+  digitalWrite(STBY, HIGH);
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  if (motorStopTimer > 0 && millis() > motorStopTimer) { motorWifi(0); motorStopTimer = 0; }
+  if (isAutoSleeping && millis() > modeRestoreTimer) { randomMode = backupMode; isAutoSleeping = false; }
+  if (millis() - lastWebControlTime > 5000) { button.tick(isTouching()); }
+
+  if (displayFeedbackActive) {
+    if (millis() - feedbackStartTime < feedbackDuration) {
+      display.clearDisplay();
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); 
+      int16_t w = u8g2Fonts.getUTF8Width(feedbackText.c_str());
+      u8g2Fonts.setCursor((128 - w) / 2, 40); 
+      u8g2Fonts.print(feedbackText);
+      display.display();
+    } else { 
+      displayFeedbackActive = false; 
+    }
+  } else { 
+    roboEyes.update(); 
+  }
+
+  if (!isEyeLocked && (millis() - lastMoodTime >= moodInterval)) {
+    lastMoodTime = millis();
+    currentMoodIdx = (currentMoodIdx + 1) % 4;
+    roboEyes.setMood(moods[currentMoodIdx]);
+  }
+
+  static unsigned long lastMoveTick = 0;
+  if (millis() - lastMoveTick > 40) {
+    lastMoveTick = millis();
+    if (randomMode == RANDOM_SOFT && random(120) == 1) MOTOR(random(9), 25, 60, 1);
+    else if (randomMode == RANDOM_NORMAL && random(100) == 1) MOTOR(random(9), 15, 50, random(15));
+  }
+}

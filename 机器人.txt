@@ -1,0 +1,633 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <U8g2_for_Adafruit_GFX.h>
+#include <FluxGarage_RoboEyes.h>
+#include <Preferences.h>
+
+/* ================= OLED & 引脚配置 ================= */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_SDA 21
+#define OLED_SCL 20
+
+#define LF   0
+#define LB   1
+#define RF   2
+#define RB   3
+#define STBY 5
+#define TOUCH_PIN 4
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
+
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+Preferences preferences;
+
+/* ================= 状态与倒计时变量 ================= */
+enum SystemState { STATE_NORMAL, STATE_MENU_TIME, STATE_MENU_CONFIRM, STATE_MENU_CUSTOM, STATE_COUNTDOWN };
+SystemState currentState = STATE_NORMAL;
+
+const int presetTimes[] = {1, 2, 3, 5, 10, 15, 20, 25, 30, 45, 60};
+int menuIndex = 0;
+unsigned long countdownDurationMs = 0;
+unsigned long countdownStartTime = 0;
+int currentSelectedMinutes = 0;
+int customBaseMinutes = 0;
+int customMaxMinutes = 0;
+int confirmMenuSelection = 0; 
+
+bool showingFaceInCountdown = false;
+unsigned long lastFaceShowTime = 0;
+unsigned long faceShowDuration = 5000;
+
+unsigned long faceIntervalAccumulator = 0;
+unsigned long lastUpdateTick = 0;
+bool hasDone60sReminder = false;
+
+int moods[] = { DEFAULT, HAPPY, ANGRY, TIRED };
+int currentMoodIdx = 0;
+unsigned long lastMoodTime = 0;
+const unsigned long moodInterval = 5000;
+bool isEyeLocked = false;
+
+bool displayFeedbackActive = false;
+unsigned long feedbackStartTime = 0;
+const unsigned long feedbackDuration = 700;
+String feedbackText = "";
+
+bool customTextActive = false;
+bool customTextLocked = false;
+unsigned long customTextStartTime = 0;
+const unsigned long customTextDuration = 15000;
+String customTextContent = "";
+int textDisplayMode = 1;
+String textLine1 = "";
+String textLine2 = "";
+int scrollX = 128;
+
+enum RandomMode { RANDOM_OFF, RANDOM_SOFT, RANDOM_NORMAL };
+volatile RandomMode randomMode = RANDOM_NORMAL;
+RandomMode backupMode = RANDOM_NORMAL;
+
+unsigned long lastWebControlTime = 0;
+unsigned long motorStopTimer = 0;
+unsigned long modeRestoreTimer = 0;
+bool isAutoSleeping = false;
+
+String sta_ssid = "";
+String sta_password = "";
+String ap_ssid = "桌面机器人";
+bool isAPMode = false;
+
+/* ================= 工具函数 ================= */
+int getSignalScore(int rssi) {
+  if (rssi == 0) return 0;
+  return constrain(rssi + 100, 0, 100);
+}
+
+bool isTouching() {
+  pinMode(TOUCH_PIN, OUTPUT);
+  digitalWrite(TOUCH_PIN, LOW);
+  delayMicroseconds(1000);
+  pinMode(TOUCH_PIN, INPUT_PULLUP);
+  uint32_t count = 0;
+  while (digitalRead(TOUCH_PIN) == LOW && count < 2000) { count++; asm volatile ("nop"); }
+  return (count > 2);
+}
+
+void drawProgressBarBorder(float progress) {
+  int remainingPixels = 384 * progress;
+  int start = 384 - remainingPixels;
+  int end = 384;
+  if (start >= end) return;
+  if (start < 128) { int s = start; int e = min(end, 128); display.drawFastHLine(s, 0, e - s, SSD1306_WHITE); }
+  if (end > 128 && start < 192) { int s = max(start, 128) - 128; int e = min(end, 192) - 128; display.drawFastVLine(127, s, e - s, SSD1306_WHITE); }
+  if (end > 192 && start < 320) { int s = max(start, 192) - 192; int e = min(end, 320) - 192; display.drawFastHLine(127 - e + 1, 63, e - s, SSD1306_WHITE); }
+  if (end > 320) { int s = max(start, 320) - 320; int e = min(end, 384) - 320; display.drawFastVLine(0, 63 - e + 1, e - s, SSD1306_WHITE); }
+}
+
+void startCountdown(int minutes) {
+  countdownDurationMs = (unsigned long)minutes * 60000;
+  countdownStartTime = millis();
+  currentState = STATE_COUNTDOWN;
+  randomMode = RANDOM_OFF; 
+  isAutoSleeping = true;
+  motorStopTimer = 0;
+  showingFaceInCountdown = false;
+  faceIntervalAccumulator = 0;
+  lastUpdateTick = millis();
+  hasDone60sReminder = false;
+}
+
+WebServer server(80);
+
+// 用于网页拦截检查
+bool checkCountdownBlock() {
+  if (currentState == STATE_COUNTDOWN) {
+    return true; // 仅返回状态，弹窗逻辑交给前端处理
+  }
+  return false;
+}
+
+String getStatusJSON() {
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  bool default_ap = preferences.getBool("default_ap", false);
+  int reportMode = (int)backupMode; // 反馈新模式，即使不执行
+
+  String cdActive = (currentState == STATE_COUNTDOWN) ? "true" : "false";
+  String cdRem = "";
+  if (currentState == STATE_COUNTDOWN) {
+    unsigned long elapsed = millis() - countdownStartTime;
+    unsigned long rem = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) : 0;
+    int rMin = (rem / 1000) / 60;
+    int rSec = (rem / 1000) % 60;
+    char buf[10]; sprintf(buf, "%02d:%02d", rMin, rSec);
+    cdRem = String(buf);
+  }
+
+  return "{\"mode\":" + String(reportMode) +
+  ",\"lock\":" + String((isEyeLocked || customTextLocked) ? 1 : 0) +
+  ",\"saved_ssid\":\"" + sta_ssid + "\"" +
+  ",\"ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"" +
+  ",\"rssi\":" + String(getSignalScore(rssi)) +
+  ",\"default_ap\":" + String(default_ap ? "true" : "false") +
+  ",\"cd_active\":" + cdActive +
+  ",\"cd_rem\":\"" + cdRem + "\"}";
+}
+
+/* ================= 触控动作逻辑 ================= */
+void triggerModeSwitch() {
+  if (backupMode == RANDOM_OFF) backupMode = RANDOM_SOFT;
+  else if (backupMode == RANDOM_SOFT) backupMode = RANDOM_NORMAL;
+  else backupMode = RANDOM_OFF;
+  
+  if(currentState != STATE_COUNTDOWN) randomMode = backupMode;
+  
+  feedbackText = (backupMode == RANDOM_OFF) ? "睡眠模式" : (backupMode == RANDOM_SOFT ? "摆动模式" : "好奇模式");
+  displayFeedbackActive = true; feedbackStartTime = millis();
+}
+
+void triggerLockExpression() {
+  if (customTextActive) {
+    customTextLocked = !customTextLocked;
+    feedbackText = customTextLocked ? "文字已锁定" : "显示已取消";
+  } else {
+    isEyeLocked = !isEyeLocked;
+    feedbackText = isEyeLocked ? "表情已锁定" : "表情已解锁";
+  }
+  displayFeedbackActive = true; feedbackStartTime = millis();
+}
+
+void handleSingleClick() {
+  if (currentState == STATE_NORMAL) {
+    if (customTextActive) { customTextActive = false; customTextLocked = false; }
+    isEyeLocked = false; currentMoodIdx = (currentMoodIdx + 1) % 4;
+    roboEyes.setMood(moods[currentMoodIdx]); lastMoodTime = millis();
+  }
+  else if (currentState == STATE_MENU_TIME) { menuIndex = (menuIndex + 1) % 11; }
+  else if (currentState == STATE_MENU_CONFIRM) { confirmMenuSelection = (confirmMenuSelection == 0) ? 1 : 0; }
+  else if (currentState == STATE_MENU_CUSTOM) {
+    currentSelectedMinutes++;
+    if (currentSelectedMinutes >= customMaxMinutes) currentSelectedMinutes = customBaseMinutes;
+  }
+  else if (currentState == STATE_COUNTDOWN) {
+    long remSec = ((countdownDurationMs - (millis() - countdownStartTime)) / 1000);
+    if (remSec <= 55 && remSec >= 10) return;
+    if (showingFaceInCountdown) {
+        currentMoodIdx = (currentMoodIdx + 1) % 4;
+        roboEyes.setMood(moods[currentMoodIdx]);
+        lastFaceShowTime = millis();
+    } else {
+        showingFaceInCountdown = true;
+        lastFaceShowTime = millis();
+    }
+  }
+}
+
+void handleDoubleClick() {
+  if (currentState == STATE_NORMAL || currentState == STATE_COUNTDOWN) { triggerModeSwitch(); }
+  else if (currentState == STATE_MENU_TIME) { menuIndex = (menuIndex - 1 + 11) % 11; }
+  else if (currentState == STATE_MENU_CUSTOM) {
+    currentSelectedMinutes--;
+    if (currentSelectedMinutes < customBaseMinutes) currentSelectedMinutes = customMaxMinutes - 1;
+  }
+}
+
+void handleTripleClick() {
+  if (currentState == STATE_NORMAL) { triggerLockExpression(); }
+}
+
+void handleLongPress() {
+  if (currentState == STATE_NORMAL) { currentState = STATE_MENU_TIME; menuIndex = 0; }
+  else if (currentState == STATE_MENU_TIME) {
+    currentSelectedMinutes = presetTimes[menuIndex];
+    if (currentSelectedMinutes >= 5) { currentState = STATE_MENU_CONFIRM; confirmMenuSelection = 0; }
+    else { startCountdown(currentSelectedMinutes); }
+  }
+  else if (currentState == STATE_MENU_CONFIRM) {
+    if (confirmMenuSelection == 0) { startCountdown(currentSelectedMinutes); }
+    else {
+      currentState = STATE_MENU_CUSTOM; customBaseMinutes = currentSelectedMinutes;
+      customMaxMinutes = currentSelectedMinutes + 15;
+      for(int i=0; i<10; i++) { if(presetTimes[i] == currentSelectedMinutes) { customMaxMinutes = presetTimes[i+1]; break; } }
+    }
+  }
+  else if (currentState == STATE_MENU_CUSTOM) { startCountdown(currentSelectedMinutes); }
+  else if (currentState == STATE_COUNTDOWN) {
+    currentState = STATE_NORMAL; randomMode = backupMode;
+    displayFeedbackActive = true; feedbackText = "倒计时解除"; feedbackStartTime = millis();
+  }
+}
+
+/* ================= 系统组件 ================= */
+void analyzeCustomText() {
+  int totalWidth = u8g2Fonts.getUTF8Width(customTextContent.c_str());
+  int totalChars = 0; int i = 0; int len = customTextContent.length();
+  while (i < len) {
+    char c = customTextContent[i];
+    if ((c & 0x80) == 0) i += 1; else if ((c & 0xE0) == 0xC0) i += 2; else if ((c & 0xF0) == 0xE0) i += 3; else if ((c & 0xF8) == 0xF0) i += 4;
+    totalChars++;
+  }
+  if (totalWidth <= 112 && totalChars <= 7) { textDisplayMode = 1; textLine1 = customTextContent; }
+  else {
+    textLine1 = ""; textLine2 = ""; int w1 = 0; i = 0; int charCount1 = 0;
+    while (i < len) {
+      char c = customTextContent[i]; int charLen = 1;
+      if ((c & 0x80) == 0) charLen = 1; else if ((c & 0xE0) == 0xC0) charLen = 2; else if ((c & 0xF0) == 0xE0) charLen = 3; else if ((c & 0xF8) == 0xF0) charLen = 4;
+      String singleChar = customTextContent.substring(i, i + charLen);
+      int cw = u8g2Fonts.getUTF8Width(singleChar.c_str());
+      if (charCount1 < 7 && w1 + cw <= 112) { textLine1 += singleChar; w1 += cw; charCount1++; }
+      else { textLine2 += customTextContent.substring(i); break; }
+      i += charLen;
+    }
+    textDisplayMode = (u8g2Fonts.getUTF8Width(textLine2.c_str()) <= 112 && (totalChars - charCount1) <= 7) ? 2 : 3;
+    scrollX = 128;
+  }
+}
+
+void startAP() {
+  isAPMode = true; WiFi.mode(WIFI_AP); WiFi.softAP(ap_ssid.c_str());
+  for (int i = 3; i > 0; i--) {
+    display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("热点模式");
+    u8g2Fonts.setCursor(0, 31); u8g2Fonts.print("连接WiFi：" + ap_ssid);
+    u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip：192.168.4.1");
+    u8g2Fonts.setCursor(0, 62); u8g2Fonts.print(String(i) + "秒后进入系统");
+    display.display(); delay(1000);
+  }
+}
+
+void initWiFi() {
+  preferences.begin("wifi-cfg", false);
+  sta_ssid = preferences.getString("ssid", ""); sta_password = preferences.getString("password", ""); ap_ssid = preferences.getString("ap_ssid", "桌面机器人");
+  if (preferences.getBool("default_ap", false) || sta_ssid == "") { startAP(); }
+  else {
+    WiFi.mode(WIFI_STA); WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    unsigned long startTime = millis(); bool connected = false;
+    while (millis() - startTime < 5000) {
+      if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+      display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+      u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：正在连接");
+      u8g2Fonts.setCursor(0, 31); u8g2Fonts.print(sta_ssid);
+      u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：" + WiFi.localIP().toString());
+      u8g2Fonts.setCursor(0, 62); u8g2Fonts.print("信号强度：" + String(getSignalScore(WiFi.RSSI())) + "dBm");
+      display.display(); delay(200);
+    }
+    if (connected) {
+      isAPMode = false;
+      for (int i = 3; i > 0; i--) {
+        display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+        u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：已连接");
+        u8g2Fonts.setCursor(0, 31); u8g2Fonts.print(sta_ssid);
+        u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：" + WiFi.localIP().toString());
+        u8g2Fonts.setCursor(0, 62); u8g2Fonts.print("信号强度：" + String(getSignalScore(WiFi.RSSI())) + "dBm，" + String(i) + "s");
+        display.display(); delay(1000);
+      }
+    } else { preferences.putBool("default_ap", true); startAP(); }
+  }
+  display.clearDisplay(); display.display();
+}
+
+void motorWifi(byte c) {
+  digitalWrite(STBY, HIGH);
+  switch (c) {
+    case 0: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+    case 1: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+    case 2: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+    case 3: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+    case 4: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+  }
+}
+
+// 优化后的强提醒逻辑
+void playStrongReminder() {
+  motorWifi(3); // 左转 1s
+  unsigned long st = millis(); while(millis() - st < 1000) { server.handleClient(); yield(); }
+  motorWifi(0); // 停顿 0.5s
+  st = millis(); while(millis() - st < 500) { server.handleClient(); yield(); }
+  motorWifi(4); // 右转 1s
+  st = millis(); while(millis() - st < 1000) { server.handleClient(); yield(); }
+  motorWifi(0);
+}
+
+void MOTOR(byte c, int t1, int t2, int Time) {
+  if (randomMode == RANDOM_OFF || currentState == STATE_COUNTDOWN) return;
+  for (int i = 0; i < Time; i++) {
+    switch (c) {
+      case 0: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+      case 1: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+      case 2: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+      case 3: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+      case 4: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+      case 5: digitalWrite(LF, LOW); digitalWrite(LB, HIGH); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+      case 6: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, HIGH); break;
+      case 7: digitalWrite(LF, HIGH); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW); break;
+      case 8: digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, HIGH); digitalWrite(RB, LOW); break;
+    }
+    unsigned long start = millis(); while(millis() - start < t1) { server.handleClient(); yield(); }
+    digitalWrite(LF, LOW); digitalWrite(LB, LOW); digitalWrite(RF, LOW); digitalWrite(RB, LOW);
+    start = millis(); while(millis() - start < t2) { server.handleClient(); yield(); }
+  }
+}
+
+void handleMovement(byte dir) {
+  if (currentState == STATE_COUNTDOWN) return;
+  motorWifi(dir);
+  lastWebControlTime = millis(); motorStopTimer = millis() + 10000;
+  if (!isAutoSleeping) { backupMode = randomMode; randomMode = RANDOM_OFF; isAutoSleeping = true; }
+  modeRestoreTimer = millis() + 15000;
+}
+
+DNSServer dnsServer;
+
+void handleRoot() {
+  String page = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">  <title>控制中心</title><style>  
+body{margin:0;background:#000;color:#00ffe1;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;padding:10px;touch-action:manipulation;}  
+.panel{width:90%;max-width:300px;padding:15px;border-radius:18px;background:rgba(0,255,225,0.05);border:1px solid rgba(0,255,225,0.4);margin-bottom:15px;}  
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;}  
+button{border:none;border-radius:10px;font-size:16px;background:linear-gradient(145deg,#0ff,#00b3a4);padding:12px 0;cursor:pointer;font-weight:bold;color:#000;transition:0.1s;}  
+button:active{opacity:0.6;transform:scale(0.92);}  
+.mode, .expr{display:flex;gap:5px;margin-top:10px;}  
+.mode button, .expr button{flex:1;font-size:12px;opacity:0.4;background:#444;color:#fff;}  
+.active{opacity:1 !important;background:linear-gradient(145deg,#00ff9c,#00c46a) !important; color:#000 !important;}  
+.btn-row{display:flex;gap:10px;margin-top:10px;}
+.btn-half{flex:1;margin-top:0 !important;}
+.orange-btn { background: linear-gradient(145deg, #ff9800, #e65100) !important; color: #fff !important; width: 100%; margin-top: 10px;}  
+.purple-btn { background: linear-gradient(145deg, #a100ff, #7100b3) !important; color: #fff !important;}  
+.timer-btn { background: linear-gradient(145deg, #4facfe, #00f2fe) !important; color: #fff !important;}  
+.modal {display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); justify-content: center; align-items: center;}  
+.modal-content {background: #111; padding: 20px; border-radius: 20px; border: 1px solid #0ff; width: 80%; max-width: 280px; display: flex; flex-direction: column; gap: 10px;}  
+input {background: #222; border: 1px solid #0ff; color: #fff; padding: 12px; border-radius: 8px;}  
+.info { font-size: 11px; color: #888; text-align: center; }  
+</style></head><body>  
+<div class="panel"><h2>控制中心</h2><div class="grid">  
+    <div></div><button onclick="checkCD(()=>move('/f'))">前进</button><div></div>  
+    <button onclick="checkCD(()=>move('/l'))">左转</button><button style="background:#f55;color:#fff;" onclick="move('/s',true)">停止</button><button onclick="checkCD(()=>move('/r'))">右转</button>  
+    <div></div><button onclick="checkCD(()=>move('/b'))">后退</button><div></div>  
+</div></div>  
+<div class="panel"><h3>模式与表情</h3><div class="mode">  
+    <button id="m_0" onclick="send('/mode_off')">睡眠</button>  
+    <button id="m_1" onclick="send('/mode_soft')">摆动</button>  
+    <button id="m_2" onclick="send('/mode_normal')">好奇</button>  
+</div><div class="expr">  
+    <button onclick="send('/expr_next')">切换表情</button>  
+    <button id="btn_lock_expr" onclick="send('/expr_lock')">锁定表情</button>  
+</div></div>  
+<div class="panel">  
+    <div class="btn-row">
+        <button id="btn_timer" class="timer-btn btn-half" onclick="openTimerModal()">倒计时</button>  
+        <button class="purple-btn btn-half" onclick="checkCD(()=>openTextModal())">显示文字</button>  
+    </div>
+    <button style="width:100%; background:linear-gradient(145deg,#00d4ff,#005f73); margin-top:10px;" onclick="checkCD(()=>openWifiModal())">配置 WiFi</button>  
+    <button id="btn_toggle_mode" class="orange-btn" onclick="checkCD(()=>toggleMode())">切换模式</button>  
+    <div id="status" class="info" style="margin-top:10px;">状态加载中...</div>  
+</div>  
+
+<div id="blockModal" class="modal" onclick="closeBlockModal()">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <h3 id="blockMsg" style="text-align:center; color:#0ff;">正在倒计时...</h3>
+        <p style="text-align:center; font-size:14px;">请结束或关闭后重试</p>
+        <div style="display:flex; gap:10px;">
+            <button style="flex:1; background:#f55; color:#fff;" onclick="stopTimerWeb(); closeBlockModal();">结束倒计时</button>
+            <button style="flex:1; background:#444; color:#fff;" onclick="closeBlockModal()">好的</button>
+        </div>
+    </div>
+</div>
+
+<div id="timerModal" class="modal"><div class="modal-content">  
+  <h3>倒计时设定</h3><input type="number" id="timerMins" placeholder="输入分钟数 (1-120)">  
+  <div style="display:flex;gap:5px;"><button style="background:#00ff9c;flex:1;" onclick="startTimerWeb()">开始</button>  
+  <button style="background:#f55;flex:1;color:#fff;" onclick="stopTimerWeb()">结束</button></div>  
+  <button onclick="closeTimerModal()" style="background:#444; color:#fff;">返回</button>  
+</div></div>  
+
+<div id="wifiModal" class="modal"><div class="modal-content">  
+    <h3>网络配置</h3><input type="text" id="ssid" placeholder="WiFi SSID"><input type="password" id="pass" placeholder="Password">  
+    <button style="background:#00ff9c" onclick="saveWiFi()">保存</button>  
+    <hr style="border:0; border-top:1px solid #444;">  
+    <input type="text" id="ap_name" placeholder="热点名称"><button style="background:#00ffe1" onclick="saveAPName()">修改热点</button>  
+    <button onclick="closeWifiModal()" style="background:#444; color:#fff;">关闭</button>  
+</div></div>  
+
+<div id="textModal" class="modal"><div class="modal-content">  
+  <h3>自定义文字</h3><input type="text" id="customMsg" placeholder="输入内容">  
+  <button style="background:#00ffe1" onclick="sendCustomText()">发送</button>  
+  <button style="background:#f55; color:#fff;" onclick="clearCustomText()">清除</button>  
+  <button onclick="closeTextModal()">返回</button>  
+</div></div>  
+
+<script>  
+let isCD = false; let remT = "00:00";
+function checkCD(fn) { if(isCD) { document.getElementById('blockMsg').innerText = "正在倒计时："+remT; document.getElementById('blockModal').style.display='flex'; } else fn(); }
+function closeBlockModal() { document.getElementById('blockModal').style.display='none'; }
+async function move(u, isS = false) { fetch(u); if(isS) setTimeout(updateStatus, 100); }  
+function render(d){  
+  isCD = d.cd_active === "true" || d.cd_active === true; remT = d.cd_rem;
+  document.querySelectorAll('.mode button').forEach((b,i)=>b.classList.toggle('active',i==d.mode));  
+  document.getElementById('status').innerHTML = `IP: ${d.ip} | 信号: ${d.rssi}%`;  
+  document.getElementById('btn_toggle_mode').innerText = d.default_ap ? '切换为WiFi模式' : '切换为热点模式';  
+  document.getElementById('btn_timer').innerText = isCD ? remT : "倒计时";  
+}  
+function updateStatus() { fetch('/status').then(r=>r.json()).then(d=>render(d)); }
+function send(u){ fetch(u).then(()=>updateStatus()); }  
+function openWifiModal() { document.getElementById('wifiModal').style.display = 'flex'; }  
+function closeWifiModal() { document.getElementById('wifiModal').style.display = 'none'; }  
+function openTimerModal() { document.getElementById('timerModal').style.display = 'flex'; }  
+function closeTimerModal() { document.getElementById('timerModal').style.display = 'none'; }  
+function openTextModal() { document.getElementById('textModal').style.display = 'flex'; }  
+function closeTextModal() { document.getElementById('textModal').style.display = 'none'; }  
+function saveWiFi(){ fetch(`/set_wifi?s=${encodeURIComponent(document.getElementById('ssid').value)}&p=${encodeURIComponent(document.getElementById('pass').value)}`); closeWifiModal(); }  
+function saveAPName(){ fetch(`/set_ap_name?ap=${encodeURIComponent(document.getElementById('ap_name').value)}`); closeWifiModal(); }  
+function sendCustomText(){ fetch(`/display_text?msg=${encodeURIComponent(document.getElementById('customMsg').value)}`); closeTextModal(); }  
+function clearCustomText(){ fetch(`/display_text?msg=`); closeTextModal(); }  
+function startTimerWeb() { let m = document.getElementById('timerMins').value; if(m>0) fetch(`/start_timer?m=${m}`).then(()=>closeTimerModal()); }  
+function stopTimerWeb() { fetch(`/stop_timer`).then(()=>closeTimerModal()); }  
+function toggleMode(){ if(confirm("重启切换模式？")) fetch('/toggle_mode').then(()=>location.reload()); }  
+setInterval(updateStatus, 2000); updateStatus();  
+</script></body></html>  )rawliteral";
+  server.send(200, "text/html", page);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
+  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT); pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  u8g2Fonts.begin(display);
+  u8g2Fonts.setFontMode(1); u8g2Fonts.setForegroundColor(SSD1306_WHITE);
+  initWiFi();
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
+  roboEyes.setAutoblinker(true, 3, 2); 
+  roboEyes.setIdleMode(true, 2, 2);
+  roboEyes.setMood(moods[currentMoodIdx]);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  server.on("/f", []() { handleMovement(1); server.send(204); });
+  server.on("/b", []() { handleMovement(2); server.send(204); });
+  server.on("/l", []() { handleMovement(3); server.send(204); });
+  server.on("/r", []() { handleMovement(4); server.send(204); });
+  server.on("/s", []() { motorWifi(0); motorStopTimer=0; server.send(204); });
+  server.on("/", handleRoot);
+  server.on("/status", []() { server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_off", []() { backupMode=RANDOM_OFF; if(currentState!=STATE_COUNTDOWN) randomMode=RANDOM_OFF; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_soft", []() { backupMode=RANDOM_SOFT; if(currentState!=STATE_COUNTDOWN) randomMode=RANDOM_SOFT; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_normal", []() { backupMode=RANDOM_NORMAL; if(currentState!=STATE_COUNTDOWN) randomMode=RANDOM_NORMAL; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/expr_next", []() {
+    if (customTextActive) { customTextActive = false; customTextLocked = false; }
+    isEyeLocked=false; currentMoodIdx=(currentMoodIdx+1)%4; roboEyes.setMood(moods[currentMoodIdx]);
+    server.send(200, "application/json", getStatusJSON());
+  });
+  server.on("/expr_lock", []() { triggerLockExpression(); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/toggle_mode", []() { preferences.putBool("default_ap", !preferences.getBool("default_ap", false)); server.send(200, "text/plain", "OK"); delay(500); ESP.restart(); });
+  server.on("/set_wifi", []() { preferences.putString("ssid", server.arg("s")); preferences.putString("password", server.arg("p")); server.send(200, "text/plain", "OK"); });
+  server.on("/set_ap_name", []() { preferences.putString("ap_ssid", server.arg("ap")); server.send(200, "text/plain", "OK"); });
+  server.on("/start_timer", []() { int m = server.arg("m").toInt(); if(m>0) { startCountdown(m); server.send(200, "text/plain", "OK"); } });
+  server.on("/stop_timer", []() { currentState = STATE_NORMAL; randomMode = backupMode; server.send(200, "text/plain", "OK"); });
+  server.on("/display_text", []() {
+    customTextContent = server.arg("msg");
+    if (customTextContent == "") { customTextActive = false; customTextLocked = false; }
+    else { customTextActive = true; customTextLocked = false; customTextStartTime = millis(); analyzeCustomText(); }
+    server.send(200, "text/plain", "OK");
+  });
+  server.onNotFound([]() { if(isAPMode) { server.sendHeader("Location", "http://192.168.4.1", true); server.send(302); } });
+  server.begin();
+  digitalWrite(STBY, HIGH);
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  if (motorStopTimer > 0 && millis() > motorStopTimer) { motorWifi(0); motorStopTimer = 0; }
+  if (isAutoSleeping && millis() > modeRestoreTimer) { randomMode = backupMode; isAutoSleeping = false; }
+
+  static unsigned long touchStartT = 0, touchReleaseT = 0;
+  static int tCount = 0; static bool tActive = false, lpHandled = false;
+  bool currTouch = isTouching();
+  if (currTouch) { if (!tActive) { tActive = true; touchStartT = millis(); lpHandled = false; }
+    else if (!lpHandled && (millis() - touchStartT > 800)) { handleLongPress(); lpHandled = true; tCount = 0; }
+  } else { if (tActive) { tActive = false; if (!lpHandled) { tCount++; touchReleaseT = millis(); } } }
+  if (tCount > 0 && !currTouch && (millis() - touchReleaseT > 1000)) {
+    if (tCount == 1) handleSingleClick(); else if (tCount == 2) handleDoubleClick(); else if (tCount >= 3) handleTripleClick();
+    tCount = 0;
+  }
+
+  if (currentState == STATE_COUNTDOWN) {
+      unsigned long now = millis();
+      unsigned long elapsed = now - countdownStartTime;
+      long remainingMs = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) : 0;
+      long remSec = remainingMs / 1000;
+      if (remSec == 60 && !hasDone60sReminder) { hasDone60sReminder = true; playStrongReminder(); lastUpdateTick = millis(); }
+      if (remainingMs == 0) { currentState = STATE_NORMAL; randomMode = backupMode; feedbackText = "结束"; feedbackStartTime = millis(); showingFaceInCountdown = false; motorWifi(0); }
+      else {
+          bool inBlockedRange = (remSec <= 55 && remSec >= 10);
+          if (inBlockedRange) showingFaceInCountdown = false;
+          else {
+              faceIntervalAccumulator += (now - lastUpdateTick);
+              if (faceIntervalAccumulator >= 40000) { showingFaceInCountdown = true; lastFaceShowTime = now; faceIntervalAccumulator = 0; }
+              if (showingFaceInCountdown && (now - lastFaceShowTime >= 5000)) showingFaceInCountdown = false;
+          }
+      }
+      lastUpdateTick = now;
+  }
+
+  if (displayFeedbackActive) {
+    if (millis() - feedbackStartTime < feedbackDuration) {
+      display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+      int16_t w = u8g2Fonts.getUTF8Width(feedbackText.c_str());
+      u8g2Fonts.setCursor((128 - w) / 2, 40); u8g2Fonts.print(feedbackText); display.display();
+    } else displayFeedbackActive = false;
+  }
+  else if (currentState != STATE_NORMAL) {
+    display.clearDisplay();
+    if (currentState == STATE_MENU_TIME) {
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); display.drawRect(0, 22, 128, 20, SSD1306_WHITE);
+      if (menuIndex > 0) { u8g2Fonts.setCursor(35, 16); u8g2Fonts.print(String(presetTimes[menuIndex - 1]) + " 分钟"); }
+      u8g2Fonts.setCursor(35, 38); u8g2Fonts.print(String(presetTimes[menuIndex]) + " 分钟");
+      if (menuIndex < 10) { u8g2Fonts.setCursor(35, 60); u8g2Fonts.print(String(presetTimes[menuIndex + 1]) + " 分钟"); }
+    }
+    else if (currentState == STATE_MENU_CONFIRM) {
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); u8g2Fonts.setCursor(35, 25); u8g2Fonts.print(String(currentSelectedMinutes) + " 分钟");
+      if (confirmMenuSelection == 0) display.fillRect(15, 40, 40, 20, SSD1306_WHITE); else display.drawRect(15, 40, 40, 20, SSD1306_WHITE);  
+      if (confirmMenuSelection == 1) display.fillRect(75, 40, 40, 20, SSD1306_WHITE); else display.drawRect(75, 40, 40, 20, SSD1306_WHITE);  
+      display.setTextColor(confirmMenuSelection == 0 ? SSD1306_BLACK : SSD1306_WHITE); u8g2Fonts.setCursor(19, 56); u8g2Fonts.print("开始");  
+      display.setTextColor(confirmMenuSelection == 1 ? SSD1306_BLACK : SSD1306_WHITE); u8g2Fonts.setCursor(75, 56); u8g2Fonts.print("自定义");  
+      display.setTextColor(SSD1306_WHITE);   
+    }  
+    else if (currentState == STATE_MENU_CUSTOM) {  
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); u8g2Fonts.setCursor(10, 20); u8g2Fonts.print("自定义时间:");  
+      u8g2Fonts.setCursor(45, 45); u8g2Fonts.print(String(currentSelectedMinutes) + " 分钟");  
+    }  
+    else if (currentState == STATE_COUNTDOWN) {  
+        if (showingFaceInCountdown) roboEyes.update();
+        else {
+            unsigned long elapsed = millis() - countdownStartTime;
+            long remMs = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) : 0;
+            long remSec = remMs / 1000;
+            // 30秒闪烁逻辑
+            if (remSec >= 30 || (millis() % 500 < 250)) {
+                int rMin = remSec / 60; int rSec = remSec % 60;  
+                display.setTextSize(3); display.setCursor(22, 22);  
+                if(rMin<10) display.print("0"); display.print(rMin); display.print(":");  
+                if(rSec<10) display.print("0"); display.print(rSec);  
+            }
+            drawProgressBarBorder((float)remMs / countdownDurationMs);
+        }
+    }  
+    if (currentState != STATE_COUNTDOWN || !showingFaceInCountdown) display.display();
+  }
+  else if (customTextActive) {
+    if (!customTextLocked && (millis() - customTextStartTime >= customTextDuration)) { customTextActive = false; }
+    else {
+      display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+      if (textDisplayMode == 1) { int w = u8g2Fonts.getUTF8Width(textLine1.c_str()); u8g2Fonts.setCursor((128 - w) / 2, 40); u8g2Fonts.print(textLine1); }
+      else if (textDisplayMode == 2) {
+        int w1 = u8g2Fonts.getUTF8Width(textLine1.c_str()); int w2 = u8g2Fonts.getUTF8Width(textLine2.c_str());
+        u8g2Fonts.setCursor((128 - w1) / 2, 28); u8g2Fonts.print(textLine1); u8g2Fonts.setCursor((128 - w2) / 2, 52); u8g2Fonts.print(textLine2);
+      }
+      else if (textDisplayMode == 3) {
+        u8g2Fonts.setCursor(scrollX, 40); u8g2Fonts.print(customTextContent);
+        static unsigned long lastSc = 0; if (millis() - lastSc > 25) { lastSc = millis(); scrollX -= 2; if (scrollX < -u8g2Fonts.getUTF8Width(customTextContent.c_str())) scrollX = 128; }
+      }
+      if (!customTextLocked) { int barW = map(millis() - customTextStartTime, 0, customTextDuration, 128, 0); display.drawFastHLine(0, 60, barW, SSD1306_WHITE); }
+      display.display();
+    }
+  }
+  else roboEyes.update();
+
+  if (currentState == STATE_NORMAL && !isEyeLocked && !customTextLocked && (millis() - lastMoodTime >= moodInterval)) {
+    lastMoodTime = millis(); currentMoodIdx = (currentMoodIdx + 1) % 4; roboEyes.setMood(moods[currentMoodIdx]);
+  }
+  static unsigned long lastMoveTick = 0;
+  if (millis() - lastMoveTick > 40) {
+    lastMoveTick = millis();
+    if (!isAutoSleeping && currentState == STATE_NORMAL) {
+      if (randomMode == RANDOM_SOFT && random(120) == 1) MOTOR(random(9), 25, 60, 1);
+      else if (randomMode == RANDOM_NORMAL && random(100) == 1) MOTOR(random(9), 15, 50, random(15));
+    }
+  }
+}

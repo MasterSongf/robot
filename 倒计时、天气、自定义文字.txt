@@ -1,0 +1,1011 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <Adafruit_SSD1306.h>
+#include <U8g2_for_Adafruit_GFX.h>
+#include <FluxGarage_RoboEyes.h>
+
+/* ================= OLED & 引脚配置 ================= */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_SDA 20
+#define OLED_SCL 10
+
+#define LF   0
+#define LB   1
+#define RF   2
+#define RB   3
+#define STBY 5
+#define TOUCH_PIN 4
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
+
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+Preferences preferences;
+
+/* ================= 状态与倒计时变量 ================= */
+enum SystemState { STATE_NORMAL, STATE_MENU_TIME, STATE_MENU_CONFIRM, STATE_MENU_CUSTOM, STATE_COUNTDOWN, STATE_TEXT_LOCKED_HINT };
+SystemState currentState = STATE_NORMAL;
+
+const int presetTimes[] = {1, 2, 3, 5, 10, 15, 20, 25, 30, 45, 60, 90, 120};
+int menuIndex = 0;
+unsigned long countdownDurationMs = 0;
+unsigned long countdownStartTime = 0;
+int currentSelectedMinutes = 0;
+int customBaseMinutes = 0;
+int customMaxMinutes = 0;
+int confirmMenuSelection = 0; 
+
+unsigned long lastUpdateTick = 0;
+bool hasDoneHalfReminder = false;
+bool hasDone8sReminder = false;
+
+int moods[] = { DEFAULT, HAPPY, ANGRY, TIRED };
+int currentMoodIdx = 0;
+unsigned long lastMoodTime = 0;
+const unsigned long moodInterval = 5000;
+bool isEyeLocked = false;
+
+bool displayFeedbackActive = false;
+unsigned long feedbackStartTime = 0;
+const unsigned long feedbackDuration = 700;
+String feedbackText = "";
+
+/* ================= 文本显示控制变量 ================= */
+bool customTextActive = false;
+bool customTextLocked = false;
+unsigned long customTextStartTime = 0;
+unsigned long customTextDurationLimit = 15000; 
+String customTextContent = "";
+int textDisplayMode = 1; 
+String textLine1 = "";
+String textLine2 = "";
+int customTextScrollX = 128; 
+
+unsigned long firstLongPressTime = 0;
+unsigned long hintStartTime = 0;
+
+enum RandomMode { RANDOM_OFF, RANDOM_SOFT, RANDOM_NORMAL };
+volatile RandomMode randomMode = RANDOM_NORMAL;
+RandomMode backupMode = RANDOM_NORMAL;
+
+unsigned long lastWebControlTime = 0;
+unsigned long motorStopTimer = 0;
+unsigned long modeRestoreTimer = 0;
+bool isAutoSleeping = false;
+
+String sta_ssid = "";
+String sta_password = "";
+String ap_ssid = "桌面机器人";
+bool isAPMode = false;
+
+/* ================= 电机调速变量 ================= */
+int speedL = 255;  
+int speedR = 255;  
+
+/* ================= 时间与天气变量 ================= */
+String seniverseKey = "SEIbs3UgOntyv30m3";
+struct WeatherInfo {
+  String city;
+  String todayHighTemp;
+  String todayTextDay;
+  String forecastData;       
+  String forecastData7Days;  
+};
+WeatherInfo weatherData;
+bool isWeatherTimeActive = false;
+unsigned long weatherDisplayStartTime = 0;
+unsigned long bootTime = 0;
+int lastWeatherTriggerMinute = -1;
+int weatherScrollX = 128;
+unsigned long lastWeatherUpdate = 0;
+
+WebServer server(80);
+DNSServer dnsServer;
+
+/* ================= 工具与天气函数 ================= */
+int getSignalScore(int rssi) {
+  if (rssi == 0) return 0;
+  return constrain(rssi + 100, 0, 100);
+}
+
+void saveWeatherToCache(String city, String date, String high, String text, String forecast, String forecast7) {
+  preferences.putString("w_city", city);
+  preferences.putString("w_date", date);
+  preferences.putString("w_high", high);
+  preferences.putString("w_text", text);
+  preferences.putString("w_fcast", forecast);
+  preferences.putString("w_fcast7", forecast7);
+}
+
+void updateWeatherTask() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "http://api.seniverse.com/v3/weather/daily.json?key=" + seniverseKey + "&location=ip&language=zh-Hans&unit=c&start=0&days=7";
+  http.begin(url);
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(4096); 
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error && doc["results"].size() > 0) {
+      JsonObject loc = doc["results"][0]["location"];
+      weatherData.city = loc["name"].as<String>();
+      
+      JsonArray daily = doc["results"][0]["daily"];
+      if (daily.size() > 0) {
+          weatherData.todayHighTemp = daily[0]["high"].as<String>();
+          weatherData.todayTextDay = daily[0]["text_day"].as<String>();
+
+          String fcastNormal = "";
+          String fcast7Days = "";
+
+          for (size_t i = 0; i < daily.size(); i++) {
+              String dayName;
+              if (i == 0) dayName = "今日";
+              else if (i == 1) dayName = "明日";
+              else if (i == 2) dayName = "后天";
+              else dayName = daily[i]["date"].as<String>().substring(5); 
+
+              String singleDay = dayName + ":" + daily[i]["text_day"].as<String>() + " " + daily[i]["low"].as<String>() + "-" + daily[i]["high"].as<String>() + "C";
+              
+              if (i < 3) {
+                  fcastNormal += singleDay + "   ";
+              }
+              fcast7Days += singleDay + "   ";
+          }
+          
+          weatherData.forecastData = fcastNormal;
+          weatherData.forecastData7Days = fcast7Days;
+          
+          saveWeatherToCache(weatherData.city, daily[0]["date"].as<String>(), weatherData.todayHighTemp, weatherData.todayTextDay, fcastNormal, fcast7Days);
+      }
+    }
+  }
+  http.end();
+}
+
+void triggerWeatherDisplay() {
+  isWeatherTimeActive = true;
+  weatherDisplayStartTime = millis();
+  weatherScrollX = 128;
+}
+
+// 专门用于打断天气显示的函数
+void interruptWeatherIfUnlocked() {
+  if (isWeatherTimeActive && !isEyeLocked) {
+    isWeatherTimeActive = false;
+  }
+}
+
+String getCurrentTimeStr() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 10)) return "--:--";
+  char timeStringBuff[10];
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo);
+  return String(timeStringBuff);
+}
+
+bool isTouching() {
+  pinMode(TOUCH_PIN, OUTPUT);
+  digitalWrite(TOUCH_PIN, LOW);
+  delayMicroseconds(1000);
+  pinMode(TOUCH_PIN, INPUT_PULLUP);
+  uint32_t count = 0;
+  while (digitalRead(TOUCH_PIN) == LOW && count < 2000) { count++; asm volatile ("nop"); }
+  return (count > 2);
+}
+
+void drawProgressBarBorder(float progress) {
+  int remainingPixels = 384 * progress;
+  int start = 384 - remainingPixels;
+  int end = 384;
+  if (start >= end) return;
+  if (start < 128) { int s = start; int e = min(end, 128); display.drawFastHLine(s, 0, e - s, SSD1306_WHITE); }
+  if (end > 128 && start < 192) { int s = max(start, 128) - 128; int e = min(end, 192) - 128; display.drawFastVLine(127, s, e - s, SSD1306_WHITE); }
+  if (end > 192 && start < 320) { int s = max(start, 192) - 192; int e = min(end, 320) - 192; display.drawFastHLine(127 - e + 1, 63, e - s, SSD1306_WHITE); }
+  if (end > 320) { int s = max(start, 320) - 320; int e = min(end, 384) - 320; display.drawFastVLine(0, 63 - e + 1, e - s, SSD1306_WHITE); }
+}
+
+void drawCountdownUI() {
+    unsigned long elapsed = millis() - countdownStartTime;
+    long remMs = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) : 0;
+    long remSec = remMs / 1000;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE); 
+    
+    int rHour = remSec / 3600;
+    int rMin = (remSec % 3600) / 60; 
+    int rSec = remSec % 60;  
+    int halfMin = (countdownDurationMs / 60000) / 2;
+    
+    bool isBlinkNormal = false; bool isBlinkFast = false;
+    if (remSec <= 15 && remSec >= 4) { isBlinkFast = true; }
+    if (rSec >= 1 && rSec <= 4) {
+        if (rMin == halfMin || rMin == 5 || rMin == 3 || rMin == 2) isBlinkNormal = true;
+    }
+    
+    bool showText = true;
+    if (isBlinkFast) showText = (millis() % 250 < 125);
+    else if (isBlinkNormal) showText = (millis() % 500 < 250);
+    
+    if (showText) {
+        if (remSec >= 3600) {
+            // 当大于等于60分钟时，显示 H:MM:SS，去掉小时位的0保证最大字体刚好适配 128px 宽屏幕
+            display.setTextSize(3); 
+            display.setCursor(2, 22); // 精确偏移居中
+            display.print(rHour); display.print(":");
+            if(rMin < 10) display.print("0"); display.print(rMin); display.print(":");
+            if(rSec < 10) display.print("0"); display.print(rSec);
+        } else {
+            // 小于60分钟，保持原来的大字体 MM:SS
+            display.setTextSize(3); 
+            display.setCursor(20, 22);
+            if(rMin < 10) display.print("0"); display.print(rMin); display.print(":");  
+            if(rSec < 10) display.print("0"); display.print(rSec);  
+        }
+    }
+    
+    drawProgressBarBorder((float)remMs / countdownDurationMs);
+    display.display();
+}
+
+void smartDelay(unsigned long ms) {
+    unsigned long start = millis();
+    while (millis() - start < ms) {
+        dnsServer.processNextRequest();
+        server.handleClient();
+        if (currentState == STATE_COUNTDOWN) drawCountdownUI();
+        yield();
+    }
+}
+
+void motorWifi(byte c) {
+  digitalWrite(STBY, HIGH);
+  switch (c) {
+    case 0: analogWrite(LF, 0); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, 0); break;
+    case 1: analogWrite(LF, speedL); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, speedR); break; 
+    case 2: analogWrite(LF, 0); analogWrite(LB, speedL); analogWrite(RF, speedR); analogWrite(RB, 0); break; 
+    case 3: analogWrite(LF, 0); analogWrite(LB, speedL); analogWrite(RF, 0); analogWrite(RB, speedR); break; 
+    case 4: analogWrite(LF, speedL); analogWrite(LB, 0); analogWrite(RF, speedR); analogWrite(RB, 0); break; 
+  }
+}
+
+void playStrongReminder() {
+    motorWifi(3); smartDelay(800);
+    motorWifi(4); smartDelay(800);
+    motorWifi(0); smartDelay(300);
+    motorWifi(4); smartDelay(800);
+    motorWifi(3); smartDelay(800);
+    motorWifi(0);
+}
+
+void startCountdown(int minutes) {
+  countdownDurationMs = (unsigned long)minutes * 60000;
+  countdownStartTime = millis();
+  currentState = STATE_COUNTDOWN;
+  randomMode = RANDOM_OFF; 
+  isAutoSleeping = true;
+  motorStopTimer = 0;
+  lastUpdateTick = millis();
+  hasDoneHalfReminder = false;
+  hasDone8sReminder = false;
+}
+
+void interruptMenuState() {
+  if (currentState == STATE_MENU_TIME || currentState == STATE_MENU_CONFIRM || currentState == STATE_MENU_CUSTOM || currentState == STATE_TEXT_LOCKED_HINT) {
+    currentState = STATE_NORMAL;
+  }
+}
+
+String getStatusJSON() {
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  bool default_ap = preferences.getBool("default_ap", false);
+  int reportMode = (int)backupMode;
+  String cdActive = (currentState == STATE_COUNTDOWN) ? "true" : "false";
+  String cdRem = "";
+  if (currentState == STATE_COUNTDOWN) {
+    unsigned long elapsed = millis() - countdownStartTime;
+    unsigned long rem = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) : 0;
+    int rMin = (rem / 1000) / 60;
+    int rSec = (rem / 1000) % 60;
+    char buf[10]; sprintf(buf, "%02d:%02d", rMin, rSec);
+    cdRem = String(buf);
+  }
+  return "{\"mode\":" + String(reportMode) +
+  ",\"lock\":" + String((isEyeLocked || customTextLocked) ? 1 : 0) +
+  ",\"text_locked\":" + String(customTextLocked ? "true" : "false") +
+  ",\"saved_ssid\":\"" + sta_ssid + "\"" +
+  ",\"ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"" +
+  ",\"rssi\":" + String(getSignalScore(rssi)) +
+  ",\"default_ap\":" + String(default_ap ? "true" : "false") +
+  ",\"cd_active\":" + cdActive +
+  ",\"cd_rem\":\"" + cdRem + "\"" +
+  ",\"speedL\":" + String(speedL) +
+  ",\"speedR\":" + String(speedR) + "}";
+}
+
+/* ================= 触控动作逻辑 ================= */
+void triggerModeSwitch() {
+  if (backupMode == RANDOM_OFF) backupMode = RANDOM_SOFT;
+  else if (backupMode == RANDOM_SOFT) backupMode = RANDOM_NORMAL;
+  else backupMode = RANDOM_OFF;
+  if(currentState != STATE_COUNTDOWN) randomMode = backupMode;
+  feedbackText = (backupMode == RANDOM_OFF) ? "睡眠模式" : (backupMode == RANDOM_SOFT ? "摆动模式" : "好奇模式");
+  displayFeedbackActive = true; feedbackStartTime = millis();
+}
+
+void triggerLockExpression() {
+  if (customTextActive) {
+    customTextLocked = !customTextLocked;
+    feedbackText = customTextLocked ? "文字已锁定" : "文字已解锁";
+  } else {
+    isEyeLocked = !isEyeLocked;
+    feedbackText = isEyeLocked ? "状态已锁定" : "状态已解锁";
+  }
+  displayFeedbackActive = true; feedbackStartTime = millis();
+}
+
+void handleSingleClick() {
+  if (customTextLocked) return; 
+  interruptWeatherIfUnlocked(); // 打断天气显示
+  
+  if (currentState == STATE_NORMAL) {
+    if (customTextActive) { customTextActive = false; customTextLocked = false; }
+    isEyeLocked = false; currentMoodIdx = (currentMoodIdx + 1) % 4;
+    roboEyes.setMood(moods[currentMoodIdx]); lastMoodTime = millis();
+  }
+  else if (currentState == STATE_MENU_TIME) { menuIndex = (menuIndex + 1) % 13; }
+  else if (currentState == STATE_MENU_CONFIRM) { confirmMenuSelection = (confirmMenuSelection == 0) ? 1 : 0; }
+  else if (currentState == STATE_MENU_CUSTOM) {
+    currentSelectedMinutes++;
+    if (currentSelectedMinutes >= customMaxMinutes) currentSelectedMinutes = customBaseMinutes;
+  }
+}
+
+void handleDoubleClick() {
+  if (currentState == STATE_NORMAL || currentState == STATE_COUNTDOWN) { triggerModeSwitch(); }
+  else if (currentState == STATE_MENU_TIME) { menuIndex = (menuIndex - 1 + 13) % 13; }
+  else if (currentState == STATE_MENU_CUSTOM) {
+    currentSelectedMinutes--;
+    if (currentSelectedMinutes < customBaseMinutes) currentSelectedMinutes = customMaxMinutes - 1;
+  }
+}
+
+void handleTripleClick() {
+  if (currentState == STATE_NORMAL) { triggerLockExpression(); }
+  else if (currentState == STATE_MENU_TIME) { currentState = STATE_NORMAL; }
+  else if (currentState == STATE_MENU_CONFIRM) { currentState = STATE_MENU_TIME; }
+  else if (currentState == STATE_MENU_CUSTOM) { currentState = STATE_MENU_CONFIRM; }
+  else if (currentState == STATE_TEXT_LOCKED_HINT) { triggerLockExpression(); currentState = STATE_NORMAL; }
+}
+
+void handleLongPress() {
+  if (customTextLocked) {
+    if (millis() - firstLongPressTime < 1500) {
+      customTextLocked = false; customTextActive = false; 
+      currentState = STATE_MENU_TIME; menuIndex = 3; 
+      firstLongPressTime = 0;
+    } else {
+      firstLongPressTime = millis();
+      currentState = STATE_TEXT_LOCKED_HINT; hintStartTime = millis();
+    }
+    return;
+  }
+  
+  interruptWeatherIfUnlocked(); // 打断天气显示
+  
+  if (currentState == STATE_NORMAL) { currentState = STATE_MENU_TIME; menuIndex = 3; }
+  else if (currentState == STATE_MENU_TIME) {
+    currentSelectedMinutes = presetTimes[menuIndex];
+    if (currentSelectedMinutes >= 5) { currentState = STATE_MENU_CONFIRM; confirmMenuSelection = 0; }
+    else { startCountdown(currentSelectedMinutes); }
+  }
+  else if (currentState == STATE_MENU_CONFIRM) {
+    if (confirmMenuSelection == 0) { startCountdown(currentSelectedMinutes); }
+    else {
+      currentState = STATE_MENU_CUSTOM; customBaseMinutes = currentSelectedMinutes;
+      customMaxMinutes = currentSelectedMinutes + 15;
+      for(int i=0; i<12; i++) { if(presetTimes[i] == currentSelectedMinutes) { customMaxMinutes = presetTimes[i+1]; break; } }
+    }
+  }
+  else if (currentState == STATE_MENU_CUSTOM) { startCountdown(currentSelectedMinutes); }
+  else if (currentState == STATE_COUNTDOWN) {
+    currentState = STATE_NORMAL; randomMode = backupMode;
+    displayFeedbackActive = true; feedbackText = "倒计时解除"; feedbackStartTime = millis();
+  }
+}
+
+/* ================= 系统组件 ================= */
+void analyzeCustomText() {
+  int totalChars = 0; int i = 0; int len = customTextContent.length();
+  int totalWidth = u8g2Fonts.getUTF8Width(customTextContent.c_str());
+  while (i < len) {
+    char c = customTextContent[i];
+    if ((c & 0x80) == 0) i += 1; else if ((c & 0xE0) == 0xC0) i += 2; else if ((c & 0xF0) == 0xE0) i += 3; else if ((c & 0xF8) == 0xF0) i += 4;
+    totalChars++;
+  }
+  if (totalWidth <= 112 && totalChars <= 7) { textDisplayMode = 1; textLine1 = customTextContent; }
+  else {
+    textLine1 = ""; textLine2 = ""; int w1 = 0; i = 0; int charCount1 = 0;
+    while (i < len) {
+      char c = customTextContent[i]; int charLen = 1;
+      if ((c & 0x80) == 0) charLen = 1; else if ((c & 0xE0) == 0xC0) charLen = 2; else if ((c & 0xF0) == 0xE0) charLen = 3; else if ((c & 0xF8) == 0xF0) charLen = 4;
+      String singleChar = customTextContent.substring(i, i + charLen);
+      int cw = u8g2Fonts.getUTF8Width(singleChar.c_str());
+      if (charCount1 < 7 && w1 + cw <= 112) { textLine1 += singleChar; w1 += cw; charCount1++; }
+      else { textLine2 += customTextContent.substring(i); break; }
+      i += charLen;
+    }
+    textDisplayMode = 2;
+  }
+}
+
+void startAP() {
+  isAPMode = true; WiFi.mode(WIFI_AP); WiFi.softAP(ap_ssid.c_str());
+  for (int i = 5; i > 0; i--) {
+    display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("热点模式");
+    u8g2Fonts.setCursor(0, 31); u8g2Fonts.print("连接WiFi：" + ap_ssid);
+    u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip：192.168.4.1");
+    u8g2Fonts.setCursor(0, 62); u8g2Fonts.print(String(i) + "秒后进入系统");
+    display.display(); delay(1000);
+  }
+}
+
+void initWiFi() {
+  preferences.begin("wifi-cfg", false);
+  sta_ssid = preferences.getString("ssid", ""); sta_password = preferences.getString("password", ""); ap_ssid = preferences.getString("ap_ssid", "桌面机器人");
+  
+  speedL = preferences.getInt("speedL", 255);
+  speedR = preferences.getInt("speedR", 255);
+
+  if (preferences.getBool("default_ap", false) || sta_ssid == "") { startAP(); }
+  else {
+    WiFi.mode(WIFI_STA); WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    unsigned long startTime = millis(); bool connected = false;
+    while (millis() - startTime < 5000) {
+      if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+      display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+      u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：正在连接");
+      u8g2Fonts.setCursor(0, 31); u8g2Fonts.print(sta_ssid);
+      u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：" + WiFi.localIP().toString());
+      u8g2Fonts.setCursor(0, 62); u8g2Fonts.print("信号强度：" + String(getSignalScore(WiFi.RSSI())) + "dBm");
+      display.display(); delay(200);
+    }
+    if (connected) {
+      isAPMode = false;
+      configTime(8 * 3600, 0, "ntp.aliyun.com", "time.pool.aliyun.com");
+      updateWeatherTask(); // 获取初次天气
+      lastWeatherUpdate = millis();
+
+      for (int i = 5; i > 0; i--) {
+        display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy12_t_gb2312);
+        u8g2Fonts.setCursor(0, 15); u8g2Fonts.print("WiFi模式：已连接");
+        u8g2Fonts.setCursor(0, 31); u8g2Fonts.print(sta_ssid);
+        u8g2Fonts.setCursor(0, 47); u8g2Fonts.print("ip地址：" + WiFi.localIP().toString());
+        u8g2Fonts.setCursor(0, 62); u8g2Fonts.print("信号强度：" + String(getSignalScore(WiFi.RSSI())) + "dBm，" + String(i) + "s");
+        display.display(); delay(1000);
+      }
+    } else { preferences.putBool("default_ap", true); startAP(); }
+  }
+  display.clearDisplay(); display.display();
+}
+
+void MOTOR(byte c, int t1, int t2, int Time) {
+  if (randomMode == RANDOM_OFF || currentState == STATE_COUNTDOWN) return;
+  for (int i = 0; i < Time; i++) {
+    switch (c) {
+      case 0: analogWrite(LF, 0); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, 0); break;
+      case 1: analogWrite(LF, 0); analogWrite(LB, speedL); analogWrite(RF, 0); analogWrite(RB, speedR); break;
+      case 2: analogWrite(LF, speedL); analogWrite(LB, 0); analogWrite(RF, speedR); analogWrite(RB, 0); break;
+      case 3: analogWrite(LF, 0); analogWrite(LB, speedL); analogWrite(RF, speedR); analogWrite(RB, 0); break;
+      case 4: analogWrite(LF, speedL); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, speedR); break;
+      case 5: analogWrite(LF, 0); analogWrite(LB, speedL); analogWrite(RF, 0); analogWrite(RB, 0); break;
+      case 6: analogWrite(LF, 0); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, speedR); break;
+      case 7: analogWrite(LF, speedL); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, 0); break;
+      case 8: analogWrite(LF, 0); analogWrite(LB, 0); analogWrite(RF, speedR); analogWrite(RB, 0); break;
+    }
+    smartDelay(t1); analogWrite(LF, 0); analogWrite(LB, 0); analogWrite(RF, 0); analogWrite(RB, 0); smartDelay(t2);
+  }
+}
+
+void handleMovement(byte dir) {
+  if (currentState == STATE_COUNTDOWN) return;
+  interruptMenuState(); motorWifi(dir);
+  lastWebControlTime = millis(); motorStopTimer = millis() + 10000;
+  if (!isAutoSleeping) { backupMode = randomMode; randomMode = RANDOM_OFF; isAutoSleeping = true; }
+  modeRestoreTimer = millis() + 15000;
+}
+
+void handleRoot() {
+  String page = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">  
+<title>控制中心</title><style>  
+body{margin:0;background:#000;color:#00ffe1;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;padding:10px;touch-action:manipulation;}  
+.panel{width:90%;max-width:300px;padding:15px;border-radius:18px;background:rgba(0,255,225,0.05);border:1px solid rgba(0,255,225,0.4);margin-bottom:15px;}  
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;}  
+h2, h3 { text-align: center; margin-top: 5px; margin-bottom: 12px; }
+button{border:none;border-radius:10px;font-size:16px;background:linear-gradient(145deg,#0ff,#00b3a4);padding:12px 0;cursor:pointer;font-weight:bold;color:#000;transition:0.1s;}  
+button:active{opacity:0.6;transform:scale(0.92);}  
+.mode, .expr{display:flex;gap:5px;margin-top:10px;}  
+.mode button, .expr button{flex:1;font-size:12px;opacity:0.4;background:#444;color:#fff;}  
+.active{opacity:1 !important;background:linear-gradient(145deg,#00ff9c,#00c46a) !important; color:#000 !important;}  
+.btn-row{display:flex;gap:10px;margin-top:10px;}
+.btn-half{flex:1;margin-top:0 !important;}
+.orange-btn { background: linear-gradient(145deg, #ff9800, #e65100) !important; color: #fff !important;}  
+.purple-btn { background: linear-gradient(145deg, #a100ff, #7100b3) !important; color: #fff !important;}  
+.timer-btn { background: linear-gradient(145deg, #4facfe, #00f2fe) !important; color: #fff !important;}  
+.weather-btn { background: linear-gradient(145deg, #a8edea, #fed6e3) !important; color: #000 !important; }
+.modal {display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); justify-content: center; align-items: center;}  
+.modal-content {background: #111; padding: 20px; border-radius: 20px; border: 1px solid #0ff; width: 80%; max-width: 280px; display: flex; flex-direction: column; gap: 10px;}  
+input {background: #222; border: 1px solid #0ff; color: #fff; padding: 12px; border-radius: 8px;}  
+.info { font-size: 11px; color: #888; text-align: center; }  
+</style></head><body>  
+<div class="panel"><h2>控制中心</h2><div class="grid">  
+    <div></div><button onclick="checkCD(()=>move('/f'))">前进</button><div></div>  
+    <button onclick="checkCD(()=>move('/l'))">左转</button><button style="background:#f55;color:#fff;" onclick="move('/s',true)">停止</button><button onclick="checkCD(()=>move('/r'))">右转</button>  
+    <div></div><button onclick="checkCD(()=>move('/b'))">后退</button><div></div>  
+</div></div>  
+<div class="panel"><h3>模式与表情</h3><div class="mode">  
+    <button id="m_0" onclick="send('/mode_off')">睡眠</button>  
+    <button id="m_1" onclick="send('/mode_soft')">摆动</button>  
+    <button id="m_2" onclick="send('/mode_normal')">好奇</button>  
+</div><div class="expr">  
+    <button onclick="checkTextLock(()=>send('/expr_next'))">切换表情</button>  
+    <button id="btn_lock_expr" onclick="send('/expr_lock')">锁定/解锁</button>  
+</div></div>  
+<div class="panel">  
+    <div class="btn-row">
+        <button id="btn_timer" class="timer-btn btn-half" onclick="openTimerModal()">番茄钟倒计时</button>  
+        <button class="purple-btn btn-half" onclick="checkCD(()=>openTextModal())">显示文字</button>  
+    </div>
+    
+    <button class="weather-btn" style="width:100%; margin-top:10px;" onclick="checkCD(()=>send('/show_weather'))">时间与天气</button>
+    
+    <div class="btn-row">
+        <button class="btn-half" style="background:linear-gradient(145deg,#00d4ff,#005f73); color:#fff;" onclick="checkCD(()=>openWifiModal())">配置 WiFi</button>  
+        <button id="btn_toggle_mode" class="btn-half" style="background:linear-gradient(145deg,#ff9800,#e65100); color:#fff;" onclick="checkCD(()=>toggleMode())">切换模式</button>
+    </div>
+
+    <div class="btn-row">
+        <button class="orange-btn btn-half" style="background: linear-gradient(145deg, #e6b800, #b38f00) !important;" onclick="checkCD(()=>openSpeedModal())">调速设置</button>
+        <button class="purple-btn btn-half" style="background: linear-gradient(145deg, #4caf50, #2e7d32) !important;" onclick="document.getElementById('guideModal').style.display='flex'">使用说明</button>
+    </div>
+    <div id="status" class="info" style="margin-top:10px;">状态加载中...</div>  
+</div>  
+
+<div id="textLockModal" class="modal"><div class="modal-content"><h3 style="text-align:center; color:#0ff;">自定义显示已锁定</h3>
+<button style="background:#f55; color:#fff;" onclick="clearCustomText(); closeTextLockModal();">关闭自定义显示</button>
+<button style="background:#444; color:#fff;" onclick="closeTextLockModal()">好的</button></div></div>
+
+<div id="blockModal" class="modal" onclick="closeBlockModal()"><div class="modal-content" onclick="event.stopPropagation()">
+<h3 id="blockMsg" style="text-align:center; color:#0ff;">正在🍅倒计时...</h3><p style="text-align:center; font-size:14px;">请结束或关闭后重试</p>
+<div style="display:flex; gap:10px;">
+<button style="flex:1; background:#f55; color:#fff;" onclick="stopTimerWeb()">结束倒计时</button>
+<button style="flex:1; background:#444; color:#fff;" onclick="closeBlockModal()">好的</button></div></div></div>
+
+<div id="timerModal" class="modal"><div class="modal-content"><h3>倒计时设定</h3><input type="number" id="timerMins" placeholder="输入分钟数 (1-120)">  
+<div style="display:flex;gap:5px;"><button style="background:#00ff9c;flex:1;" onclick="startTimerWeb()">开始</button>  
+<button style="background:#f55;flex:1;color:#fff;" onclick="stopTimerWeb()">结束</button></div><button onclick="closeTimerModal()" style="background:#444; color:#fff;">返回</button></div></div>  
+
+<div id="wifiModal" class="modal"><div class="modal-content"><h3>网络配置</h3><input type="text" id="ssid" placeholder="WiFi SSID"><input type="password" id="pass" placeholder="Password">  
+<button style="background:#00ff9c" onclick="saveWiFi()">保存</button><hr style="border:0; border-top:1px solid #444;"><input type="text" id="ap_name" placeholder="热点名称"><button style="background:#00ffe1" onclick="saveAPName()">修改热点</button><button onclick="closeWifiModal()" style="background:#444; color:#fff;">关闭</button></div></div>  
+
+<div id="saveFeedbackModal" class="modal" onclick="closeFeedbackModal()"><div class="modal-content" style="text-align:center; padding: 25px; border-color: #00ff9c;">
+<h3 style="color:#00ff9c; margin:0;">已保存反馈</h3></div></div>
+
+<div id="textModal" class="modal"><div class="modal-content"><h3>自定义文字</h3><input type="text" id="customMsg" placeholder="输入内容">  
+<div style="display:flex;gap:5px;">
+<button style="background:#00ffe1;flex:1;color:#000;" onclick="sendCustomText()">发送播放</button>
+<button style="background:#00d4ff;flex:1;color:#fff;" onclick="sendScrollText()">滚动播放</button>
+</div>
+<div style="display:flex;gap:5px; margin-top:5px;">
+<button style="background:#ff9800;flex:1;color:#fff;" onclick="toggleTextLock()">锁定显示</button>
+<button style="background:#f55; flex:1; color:#fff;" onclick="clearCustomText()">清除/退出</button>
+</div>
+<button onclick="closeTextModal()" style="background:#444; color:#fff; margin-top:5px;">关闭</button></div></div>  
+
+<div id="speedModal" class="modal"><div class="modal-content"><h3>双轮转速微调</h3>
+<div style="display:flex; justify-content:space-between; font-size:14px; margin-bottom:5px; color:#0ff;">
+  <span>当前左轮: <span id="curr_speedL">255</span></span>
+  <span>当前右轮: <span id="curr_speedR">255</span></span>
+</div>
+<input type="number" id="inp_speedL" placeholder="左轮转速 (0-255)" min="0" max="255">
+<input type="number" id="inp_speedR" placeholder="右轮转速 (0-255)" min="0" max="255">
+<button style="background:#00ff9c; color:#000;" onclick="saveSpeed()">保存并应用</button>
+<button onclick="closeSpeedModal()" style="background:#444; color:#fff;">关闭</button></div></div>
+
+<div id="guideModal" class="modal"><div class="modal-content">
+<h3 style="text-align:center; margin-top:0;">机器人使用指南</h3>
+<div style="font-size:14px; line-height:1.6; color:#ddd; margin-bottom:10px;">
+  <b>触摸区操作：</b><br>
+  👉 <b>单击</b>：切换不同小表情<br>
+  👉 <b>双击</b>：切换 睡眠/好奇/摆动 模式<br>
+  👉 <b>三击</b>：快捷锁定/解锁状态<br>
+  👉 <b>四击</b>：呼出【时间与天气】看板<br>
+  👉 <b>长按</b>：进入🍅番茄钟倒计时菜单，之后单击下一个，双击上一个，三击返回，长按确定<br>
+</div>
+<button onclick="document.getElementById('guideModal').style.display='none'" style="background:#444; color:#fff;">我明白了</button>
+</div></div>
+
+<script>  
+let isCD = false; let remT = "00:00"; let isTextLocked = false;
+function checkCD(fn) { if(isCD) { document.getElementById('blockMsg').innerText = "正在🍅倒计时："+remT; document.getElementById('blockModal').style.display='flex'; } else fn(); }
+function checkTextLock(fn) { if(isTextLocked) { document.getElementById('textLockModal').style.display='flex'; } else fn(); }
+function closeTextLockModal() { document.getElementById('textLockModal').style.display='none'; }
+function closeBlockModal() { document.getElementById('blockModal').style.display='none'; }
+async function move(u, isS = false) { fetch(u); if(isS) setTimeout(updateStatus, 100); }  
+function render(d){  
+  isCD = d.cd_active === "true" || d.cd_active === true; remT = d.cd_rem;
+  isTextLocked = d.text_locked === "true" || d.text_locked === true;
+  document.querySelectorAll('.mode button').forEach((b,i)=>b.classList.toggle('active',i==d.mode));  
+  document.getElementById('btn_lock_expr').classList.toggle('active', d.lock == 1);
+  document.getElementById('status').innerHTML = `IP: ${d.ip} | 信号: ${d.rssi}%<br>已保存WiFi: ${d.saved_ssid}`;  
+  document.getElementById('btn_toggle_mode').innerText = d.default_ap ? '切换为WiFi模式' : '切换为热点模式';  
+  
+  document.getElementById('btn_timer').innerText = isCD ? ("🍅番茄钟: " + remT) : "番茄钟倒计时";  
+  
+  window.speedL_val = d.speedL; window.speedR_val = d.speedR;
+  document.getElementById('curr_speedL').innerText = d.speedL;
+  document.getElementById('curr_speedR').innerText = d.speedR;
+}  
+function updateStatus() { fetch('/status').then(r=>r.json()).then(d=>render(d)); }
+function send(u){ fetch(u).then(()=>updateStatus()); }  
+function openWifiModal() { document.getElementById('wifiModal').style.display = 'flex'; }  
+function closeWifiModal() { document.getElementById('wifiModal').style.display = 'none'; }  
+function openTimerModal() { document.getElementById('timerModal').style.display = 'flex'; }  
+function closeTimerModal() { document.getElementById('timerModal').style.display = 'none'; }  
+function openTextModal() { document.getElementById('textModal').style.display = 'flex'; }  
+function closeTextModal() { document.getElementById('textModal').style.display = 'none'; }  
+function openSpeedModal() { document.getElementById('inp_speedL').value = window.speedL_val || 255; document.getElementById('inp_speedR').value = window.speedR_val || 255; document.getElementById('speedModal').style.display = 'flex'; }
+function closeSpeedModal() { document.getElementById('speedModal').style.display = 'none'; }
+function saveSpeed() { let l = document.getElementById('inp_speedL').value; let r = document.getElementById('inp_speedR').value; fetch(`/set_speed?l=${l}&r=${r}`).then(()=>{ closeSpeedModal(); updateStatus(); }); }
+
+function showFeedback() { document.getElementById('saveFeedbackModal').style.display = 'flex'; }
+function closeFeedbackModal() { document.getElementById('saveFeedbackModal').style.display = 'none'; }
+
+function saveWiFi(){ 
+    fetch(`/set_wifi?s=${encodeURIComponent(document.getElementById('ssid').value)}&p=${encodeURIComponent(document.getElementById('pass').value)}`); 
+    closeWifiModal(); 
+    showFeedback(); 
+}  
+function saveAPName(){ 
+    fetch(`/set_ap_name?ap=${encodeURIComponent(document.getElementById('ap_name').value)}`); 
+    closeWifiModal(); 
+    showFeedback(); 
+}  
+
+function sendCustomText(){ fetch(`/display_text?msg=${encodeURIComponent(document.getElementById('customMsg').value)}`); }  
+function sendScrollText(){ fetch(`/scroll_text?msg=${encodeURIComponent(document.getElementById('customMsg').value)}`); }  
+function toggleTextLock(){ fetch(`/toggle_text_lock`).then(()=>updateStatus()); }
+function clearCustomText(){ fetch(`/display_text?msg=`).then(()=>updateStatus()); }  
+
+function startTimerWeb() { 
+  let m = document.getElementById('timerMins').value; 
+  if(m>0) {
+    isCD = true; 
+    document.getElementById('btn_timer').innerText = "启动中...";
+    fetch(`/start_timer?m=${m}`).then(()=>{ closeTimerModal(); updateStatus(); }); 
+  } 
+}  
+function stopTimerWeb() { 
+  isCD = false; 
+  document.getElementById('btn_timer').innerText = "番茄钟倒计时";
+  fetch(`/stop_timer`).then(()=>{ closeTimerModal(); closeBlockModal(); updateStatus(); }); 
+}  
+
+function toggleMode(){ if(confirm("重启切换模式？")) fetch('/toggle_mode').then(()=>location.reload()); }  
+setInterval(updateStatus, 2000); updateStatus();  
+</script></body></html>  )rawliteral";
+  server.send(200, "text/html", page);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
+  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT); pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  u8g2Fonts.begin(display);
+  u8g2Fonts.setFontMode(1); u8g2Fonts.setForegroundColor(SSD1306_WHITE);
+  initWiFi();
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
+  roboEyes.setAutoblinker(true, 3, 2); roboEyes.setIdleMode(true, 2, 2); roboEyes.setMood(moods[currentMoodIdx]);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  
+  server.on("/f", []() { handleMovement(1); server.send(204); });
+  server.on("/b", []() { handleMovement(2); server.send(204); });
+  server.on("/l", []() { handleMovement(3); server.send(204); });
+  server.on("/r", []() { handleMovement(4); server.send(204); });
+  server.on("/s", []() { interruptMenuState(); motorWifi(0); motorStopTimer=0; server.send(204); });
+  server.on("/", handleRoot);
+  server.on("/status", []() { server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_off", []() { interruptMenuState(); backupMode=RANDOM_OFF; if(currentState!=STATE_COUNTDOWN) randomMode=RANDOM_OFF; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_soft", []() { interruptMenuState(); backupMode=RANDOM_SOFT; if(currentState!=STATE_COUNTDOWN) randomMode=RANDOM_SOFT; server.send(200, "application/json", getStatusJSON()); });
+  server.on("/mode_normal", []() { interruptMenuState(); backupMode=RANDOM_NORMAL; if(currentState!=STATE_COUNTDOWN) randomMode=RANDOM_NORMAL; server.send(200, "application/json", getStatusJSON()); });
+  
+  // 网页端操作同样会打断天气显示
+  server.on("/expr_next", []() { interruptMenuState(); interruptWeatherIfUnlocked(); if (!customTextActive) { isEyeLocked=false; currentMoodIdx=(currentMoodIdx+1)%4; roboEyes.setMood(moods[currentMoodIdx]); } server.send(200, "application/json", getStatusJSON()); });
+  server.on("/expr_lock", []() { interruptMenuState(); triggerLockExpression(); server.send(200, "application/json", getStatusJSON()); });
+  server.on("/toggle_text_lock", []() { interruptMenuState(); triggerLockExpression(); server.send(200, "text/plain", "OK"); });
+  server.on("/toggle_mode", []() { preferences.putBool("default_ap", !preferences.getBool("default_ap", false)); server.send(200, "text/plain", "OK"); delay(500); ESP.restart(); });
+  server.on("/set_wifi", []() { preferences.putString("ssid", server.arg("s")); preferences.putString("password", server.arg("p")); server.send(200, "text/plain", "OK"); });
+  server.on("/set_ap_name", []() { preferences.putString("ap_ssid", server.arg("ap")); server.send(200, "text/plain", "OK"); });
+  
+  server.on("/start_timer", []() { interruptMenuState(); interruptWeatherIfUnlocked(); int m = server.arg("m").toInt(); if(m>0) { startCountdown(m); server.send(200, "text/plain", "OK"); } });
+  server.on("/stop_timer", []() { currentState = STATE_NORMAL; randomMode = backupMode; server.send(200, "text/plain", "OK"); });
+  
+  server.on("/display_text", []() { 
+    interruptMenuState(); 
+    interruptWeatherIfUnlocked();
+    customTextContent = server.arg("msg"); 
+    if (customTextContent == "") { customTextActive = false; customTextLocked = false; } 
+    else { customTextActive = true; customTextLocked = false; customTextStartTime = millis(); customTextDurationLimit = 15000; analyzeCustomText(); } 
+    server.send(200, "text/plain", "OK"); 
+  });
+  
+  server.on("/scroll_text", []() { 
+    interruptMenuState(); 
+    interruptWeatherIfUnlocked();
+    customTextContent = server.arg("msg"); 
+    if (customTextContent == "") { 
+      customTextActive = false; customTextLocked = false; 
+    } else { 
+      customTextActive = true; customTextLocked = false; 
+      customTextStartTime = millis(); customTextDurationLimit = 15000; 
+      textDisplayMode = 3; 
+      customTextScrollX = 128; 
+    } 
+    server.send(200, "text/plain", "OK"); 
+  });
+
+  server.on("/set_speed", []() { 
+    if (server.hasArg("l")) { speedL = constrain(server.arg("l").toInt(), 0, 255); preferences.putInt("speedL", speedL); }
+    if (server.hasArg("r")) { speedR = constrain(server.arg("r").toInt(), 0, 255); preferences.putInt("speedR", speedR); }
+    server.send(200, "text/plain", "OK"); 
+  });
+  server.on("/show_weather", []() { interruptMenuState(); triggerWeatherDisplay(); server.send(200, "text/plain", "OK"); });
+  server.onNotFound([]() { if(isAPMode) { server.sendHeader("Location", "http://192.168.4.1", true); server.send(302); } });
+  server.begin();
+  digitalWrite(STBY, HIGH);
+  
+  bootTime = millis(); 
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  if (motorStopTimer > 0 && millis() > motorStopTimer) { motorWifi(0); motorStopTimer = 0; }
+  if (isAutoSleeping && millis() > modeRestoreTimer) { randomMode = backupMode; isAutoSleeping = false; }
+
+  // ---------------- 每小时更新一次天气数据 ----------------
+  if (millis() - lastWeatherUpdate > 3600000 && WiFi.status() == WL_CONNECTED) {
+    updateWeatherTask();
+    lastWeatherUpdate = millis();
+  }
+
+  // ---------------- 自动显示天气与时间逻辑 ----------------
+  if (millis() - bootTime > 180000) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 0)) { 
+      int currentMin = timeinfo.tm_min;
+      int currentSec = timeinfo.tm_sec;
+      if ((currentMin % 5 == 0 || currentMin == 0 || currentMin == 30) && currentSec == 0) {
+        if (currentMin != lastWeatherTriggerMinute) {
+          bool eligible = false;
+          // 防止倒计时菜单/进行中的倒计时被打断
+          if (currentState == STATE_NORMAL && !customTextActive) eligible = true;
+          if (customTextLocked) eligible = true;
+          
+          // 如果倒计时正在进行中，过滤掉快结束、最后五分钟、以及剩下一半时的时间
+          if (currentState == STATE_COUNTDOWN) {
+             unsigned long elapsed = millis() - countdownStartTime;
+             long remSec = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) / 1000 : 0;
+             long totalSec = countdownDurationMs / 1000;
+             if (remSec <= 300 || remSec == totalSec / 2) {
+                 eligible = false;
+             }
+          }
+
+          if (eligible) {
+            triggerWeatherDisplay();
+            lastWeatherTriggerMinute = currentMin;
+          }
+        }
+      }
+    }
+  }
+
+  // ---------------- 触摸识别 ----------------
+  static unsigned long touchStartT = 0, touchReleaseT = 0;
+  static int tCount = 0; static bool tActive = false, lpHandled = false;
+  const unsigned long T_LONG_PRESS = 600; const unsigned long T_CLICK_GAP = 1000; 
+  bool currTouch = isTouching();
+  if (currTouch) { if (!tActive) { tActive = true; touchStartT = millis(); lpHandled = false; } else if (!lpHandled && (millis() - touchStartT > T_LONG_PRESS)) { handleLongPress(); lpHandled = true; tCount = 0; } }
+  else { if (tActive) { tActive = false; if (!lpHandled) { tCount++; touchReleaseT = millis(); } } }
+  if (tCount > 0 && !currTouch && (millis() - touchReleaseT > T_CLICK_GAP)) { 
+      if (tCount == 1) handleSingleClick(); 
+      else if (tCount == 2) handleDoubleClick(); 
+      else if (tCount == 3) {
+          if (isWeatherTimeActive) {
+              isEyeLocked = !isEyeLocked; 
+              feedbackText = isEyeLocked ? "状态已锁定" : "状态已解锁";
+              displayFeedbackActive = true; feedbackStartTime = millis();
+          } else {
+              handleTripleClick(); 
+          }
+      } 
+      else if (tCount >= 4) { 
+          if (currentState == STATE_NORMAL) {
+              triggerWeatherDisplay();
+          }
+      }
+      tCount = 0; 
+  }
+
+  // ---------------- 画面渲染逻辑 ----------------
+  if (isWeatherTimeActive) {
+      if (!isEyeLocked && millis() - weatherDisplayStartTime >= 8000) {
+          isWeatherTimeActive = false;
+      } else {
+          display.clearDisplay();
+          u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+
+          bool isOffline = (isAPMode || WiFi.status() != WL_CONNECTED);
+
+          // 第一行：时间或离线标识
+          String l1 = isOffline ? "离线天气" : getCurrentTimeStr();
+          int tw = u8g2Fonts.getUTF8Width(l1.c_str());
+          u8g2Fonts.setCursor((128 - tw) / 2, 16);
+          u8g2Fonts.print(l1);
+
+          String c_city = isOffline ? preferences.getString("w_city", "") : weatherData.city;
+          if (c_city != "") {
+             // 第二行：城市 日期/气温 天气 
+             String l2;
+             if (isOffline) {
+                String c_date = preferences.getString("w_date", "");
+                if(c_date.length() >= 10) c_date = c_date.substring(5); // 提取 MM-DD
+                l2 = c_city + " " + c_date + " " + preferences.getString("w_text", "无");
+             } else {
+                l2 = c_city + " " + weatherData.todayHighTemp + "C " + weatherData.todayTextDay;
+             }
+             int lw = u8g2Fonts.getUTF8Width(l2.c_str());
+             u8g2Fonts.setCursor((128 - lw) / 2, 38);
+             u8g2Fonts.print(l2);
+             
+             // 第三行：预报滚动
+             String fcast;
+             if (isOffline) {
+                 fcast = preferences.getString(isEyeLocked ? "w_fcast7" : "w_fcast", "未缓存天气预报");
+             } else {
+                 fcast = isEyeLocked ? weatherData.forecastData7Days : weatherData.forecastData;
+             }
+             
+             u8g2Fonts.setCursor(weatherScrollX, 60);
+             u8g2Fonts.print(fcast);
+
+             static unsigned long lastSc = 0;
+             if (millis() - lastSc > 25) {
+                 lastSc = millis(); weatherScrollX -= 2;
+                 if (weatherScrollX < -u8g2Fonts.getUTF8Width(fcast.c_str())) {
+                     weatherScrollX = 128;
+                 }
+             }
+          } else {
+             u8g2Fonts.setCursor(10, 45); u8g2Fonts.print("获取天气中...");
+          }
+          display.display();
+      }
+  }
+  else if (currentState == STATE_COUNTDOWN) {
+      unsigned long now = millis();
+      unsigned long elapsed = now - countdownStartTime;
+      long remMs = (countdownDurationMs > elapsed) ? (countdownDurationMs - elapsed) : 0;
+      long remSec = remMs / 1000;
+      long totalSec = countdownDurationMs / 1000;
+      
+      if (remSec == 10 && !hasDone8sReminder) { hasDone8sReminder = true; playStrongReminder(); playStrongReminder(); }
+      if (remSec == totalSec / 2 && !hasDoneHalfReminder && totalSec > 0) { hasDoneHalfReminder = true; playStrongReminder(); }
+      
+      if (remMs == 0) { 
+          currentState = STATE_NORMAL; 
+          randomMode = backupMode; 
+          feedbackText = "结束"; 
+          feedbackStartTime = millis(); 
+          playStrongReminder(); 
+      } else {
+          drawCountdownUI();
+      }
+  }
+  else if (displayFeedbackActive) {
+    if (millis() - feedbackStartTime < feedbackDuration) {
+      display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+      int16_t w = u8g2Fonts.getUTF8Width(feedbackText.c_str());
+      u8g2Fonts.setCursor((128 - w) / 2, 40); u8g2Fonts.print(feedbackText); display.display();
+    } else displayFeedbackActive = false;
+  }
+  else if (currentState == STATE_TEXT_LOCKED_HINT) {
+    display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+    u8g2Fonts.setCursor(10, 25); u8g2Fonts.print("已锁定文字"); u8g2Fonts.setCursor(10, 50); u8g2Fonts.print("再次长按解锁");
+    display.display(); if (millis() - hintStartTime > 3000) currentState = STATE_NORMAL;
+  }
+  else if (currentState != STATE_NORMAL) {
+    display.clearDisplay();
+    if (currentState == STATE_MENU_TIME) {
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); display.drawRect(0, 22, 128, 20, SSD1306_WHITE);
+      if (menuIndex > 0) { u8g2Fonts.setCursor(35, 16); u8g2Fonts.print(String(presetTimes[menuIndex - 1]) + " 分钟"); }
+      u8g2Fonts.setCursor(35, 38); u8g2Fonts.print(String(presetTimes[menuIndex]) + " 分钟");
+      if (menuIndex < 12) { u8g2Fonts.setCursor(35, 60); u8g2Fonts.print(String(presetTimes[menuIndex + 1]) + " 分钟"); }
+    }
+    else if (currentState == STATE_MENU_CONFIRM) {
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); 
+      u8g2Fonts.setCursor(35, 25); 
+      u8g2Fonts.print(String(currentSelectedMinutes) + " 分钟");
+      
+      // 文字纯净显示，不再填充反色色块，也不会有竖线
+      u8g2Fonts.setCursor(20, 55); 
+      u8g2Fonts.print("开始");  
+      u8g2Fonts.setCursor(72, 55); 
+      u8g2Fonts.print("自定义");  
+
+      // 只有一个空心的选择框，框住当前选项
+      if (confirmMenuSelection == 0) {
+          display.drawRect(16, 39, 40, 20, SSD1306_WHITE); // 框选“开始”
+      } else {
+          display.drawRect(68, 39, 56, 20, SSD1306_WHITE); // 框选“自定义”
+      }
+    }  
+    else if (currentState == STATE_MENU_CUSTOM) {  
+      u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312); u8g2Fonts.setCursor(10, 20); u8g2Fonts.print("自定义时间:");  
+      u8g2Fonts.setCursor(45, 45); u8g2Fonts.print(String(currentSelectedMinutes) + " 分钟");  
+    }  
+    display.display();
+  }
+  else if (customTextActive) {
+    if (!customTextLocked && (millis() - customTextStartTime >= customTextDurationLimit)) { customTextActive = false; }
+    else {
+      display.clearDisplay(); u8g2Fonts.setFont(u8g2_font_wqy16_t_gb2312);
+      if (textDisplayMode == 1) { int w = u8g2Fonts.getUTF8Width(textLine1.c_str()); u8g2Fonts.setCursor((128 - w) / 2, 40); u8g2Fonts.print(textLine1); }
+      else if (textDisplayMode == 2) {
+        int w1 = u8g2Fonts.getUTF8Width(textLine1.c_str()); int w2 = u8g2Fonts.getUTF8Width(textLine2.c_str());
+        u8g2Fonts.setCursor((128 - w1) / 2, 28); u8g2Fonts.print(textLine1); u8g2Fonts.setCursor((128 - w2) / 2, 52); u8g2Fonts.print(textLine2);
+      }
+      else if (textDisplayMode == 3) {
+        u8g2Fonts.setCursor(customTextScrollX, 40);
+        u8g2Fonts.print(customTextContent);
+        static unsigned long lastSc = 0;
+        if (millis() - lastSc > 20) { 
+          lastSc = millis();
+          customTextScrollX -= 2;
+          if (customTextScrollX < -u8g2Fonts.getUTF8Width(customTextContent.c_str())) {
+            customTextScrollX = 128; 
+          }
+        }
+      }
+      display.display();
+    }
+  }
+  else roboEyes.update(); 
+
+  if (currentState == STATE_NORMAL && !isEyeLocked && !customTextLocked && !isWeatherTimeActive && (millis() - lastMoodTime >= moodInterval)) {
+    lastMoodTime = millis(); currentMoodIdx = (currentMoodIdx + 1) % 4; roboEyes.setMood(moods[currentMoodIdx]);
+  }
+  static unsigned long lastMoveTick = 0;
+  if (millis() - lastMoveTick > 40) {
+    lastMoveTick = millis();
+    if (!isAutoSleeping && currentState == STATE_NORMAL && !isWeatherTimeActive) {
+      if (randomMode == RANDOM_SOFT && random(120) == 1) MOTOR(random(9), 25, 60, 1);
+      else if (randomMode == RANDOM_NORMAL && random(100) == 1) MOTOR(random(9), 15, 50, random(15));
+    }
+  }
+}
